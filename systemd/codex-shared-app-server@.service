@@ -1,0 +1,22 @@
+[Unit]
+Description=Private shared Codex app server for %i
+Documentation=https://github.com/jesse-merhi/dotfiles
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=%i
+ExecStartPre=+/usr/local/libexec/codex-shared-socket recover-owner %i
+ExecStartPre=/bin/sh -c 'CXA_SKIP_USAGE_REFRESH=1 exec "$HOME/.local/bin/cxa" service-guard'
+ExecStartPre=+/usr/local/libexec/codex-shared-socket prepare %i
+ExecStart=/bin/sh -c 'exec "$HOME/.local/bin/codex" -c "cli_auth_credentials_store=\"file\"" app-server --listen unix:///var/lib/codex-auth/app-server.sock'
+ExecStartPost=+/usr/local/libexec/codex-shared-socket publish %i ${MAINPID}
+ExecStartPost=/bin/sh -c 'CXA_SKIP_USAGE_REFRESH=1 exec "$HOME/.local/bin/cxa" service-release'
+ExecStopPost=+/usr/local/libexec/codex-shared-socket recover-owner %i
+ExecStopPost=/bin/sh -c 'CXA_SKIP_USAGE_REFRESH=1 exec "$HOME/.local/bin/cxa" service-release'
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

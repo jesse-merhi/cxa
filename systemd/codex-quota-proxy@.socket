@@ -1,0 +1,12 @@
+[Unit]
+Description=Quota-only Codex socket for OpenClaw
+
+[Socket]
+ListenStream=/run/codex-quota-proxy.sock
+SocketUser=%i
+SocketGroup=openclaw
+SocketMode=0660
+RemoveOnStop=yes
+
+[Install]
+WantedBy=sockets.target

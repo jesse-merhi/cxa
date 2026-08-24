@@ -1,0 +1,96 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+      - run: rustup update stable --no-self-update
+      - run: rustup component add rustfmt clippy
+      - name: Verify tag matches Cargo version
+        run: |
+          version="$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | sed -n '1p')"
+          test "$GITHUB_REF_NAME" = "v$version"
+      - run: ./scripts/check.sh
+
+  build:
+    needs: verify
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            asset: cxa-linux-x86_64
+            include_helpers: true
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            asset: cxa-linux-aarch64
+            include_helpers: true
+          - runner: macos-15-intel
+            target: x86_64-apple-darwin
+            asset: cxa-macos-x86_64
+            include_helpers: false
+          - runner: macos-15
+            target: aarch64-apple-darwin
+            asset: cxa-macos-aarch64
+            include_helpers: false
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v6
+      - run: rustup update stable --no-self-update
+      - name: Build release binaries
+        env:
+          INCLUDE_HELPERS: ${{ matrix.include_helpers }}
+        run: |
+          if [[ "$INCLUDE_HELPERS" == "true" ]]; then
+            cargo build --locked --release --bins
+          else
+            cargo build --locked --release --bin cxa
+          fi
+      - name: Package archive
+        env:
+          ASSET: ${{ matrix.asset }}
+          INCLUDE_HELPERS: ${{ matrix.include_helpers }}
+        run: |
+          mkdir -p "dist/$ASSET"
+          install -m 0755 target/release/cxa "dist/$ASSET/cxa"
+          if [[ "$INCLUDE_HELPERS" == "true" ]]; then
+            install -m 0755 target/release/codex-quota-proxy "dist/$ASSET/codex-quota-proxy"
+            install -m 0755 target/release/codex-shared-socket "dist/$ASSET/codex-shared-socket"
+            cp -R systemd "dist/$ASSET/systemd"
+          fi
+          cp README.md LICENSE "dist/$ASSET/"
+          tar -C dist -czf "dist/$ASSET.tar.gz" "$ASSET"
+      - uses: actions/upload-artifact@v6
+        with:
+          name: ${{ matrix.asset }}
+          path: dist/${{ matrix.asset }}.tar.gz
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v7
+        with:
+          path: release
+          merge-multiple: true
+      - name: Create checksums
+        working-directory: release
+        run: sha256sum -- *.tar.gz > SHA256SUMS
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: gh release create "$GITHUB_REF_NAME" release/* --verify-tag --generate-notes

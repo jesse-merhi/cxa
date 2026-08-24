@@ -1,0 +1,10 @@
+[Unit]
+Description=Quota-only Codex app-server bridge for OpenClaw
+Requires=codex-shared-app-server@%i.service
+After=codex-shared-app-server@%i.service
+
+[Service]
+User=%i
+ExecStart=/usr/local/libexec/codex-quota-proxy /var/lib/codex-auth/app-server.sock
+Restart=on-failure
+RestartSec=2
