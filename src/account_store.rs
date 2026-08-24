@@ -173,9 +173,15 @@ struct TransactionState {
     activate: bool,
     select: bool,
     link_session: bool,
+    #[serde(default = "default_hold_active")]
+    hold_active: bool,
     profile_pending: Option<PathBuf>,
     #[serde(default)]
     recovery_source: Option<PathBuf>,
+}
+
+fn default_hold_active() -> bool {
+    true
 }
 
 pub struct Store {
@@ -384,12 +390,12 @@ impl Store {
         if !state_path.exists() {
             return Ok(());
         }
-        if writers_running(&self.config) {
+        let state = read_state(&state_path)?;
+        if state.hold_active && writers_running(&self.config) {
             return Err(Error::RecoveryDeferred);
         }
-        let state = read_state(&state_path)?;
         match state.mode {
-            TransactionMode::Rollback => self.restore_hold()?,
+            TransactionMode::Rollback => self.restore_active_if_held(&state)?,
             TransactionMode::Refreshing => self.recover_refresh(&state)?,
             TransactionMode::Commit => self.finish_commit(&state)?,
         }
@@ -410,6 +416,7 @@ impl Store {
             activate: false,
             select: false,
             link_session: false,
+            hold_active: true,
             profile_pending: None,
             recovery_source: None,
         };
@@ -427,7 +434,38 @@ impl Store {
             config: self.config.clone(),
             finished: false,
             irreversible: false,
+            hold_active: true,
         })
+    }
+
+    pub fn begin_enrollment(&self, source: PathBuf) -> Result<AuthBarrier> {
+        if self.config.transaction_state().exists() {
+            self.recover()?;
+        }
+        let state = TransactionState {
+            mode: TransactionMode::Refreshing,
+            slot: None,
+            activate: false,
+            select: false,
+            link_session: false,
+            hold_active: false,
+            profile_pending: None,
+            recovery_source: Some(source),
+        };
+        write_state(&self.config.transaction_state(), &state)?;
+        Ok(AuthBarrier {
+            config: self.config.clone(),
+            finished: false,
+            irreversible: false,
+            hold_active: false,
+        })
+    }
+
+    fn restore_active_if_held(&self, state: &TransactionState) -> Result<()> {
+        if state.hold_active {
+            self.restore_hold()?;
+        }
+        Ok(())
     }
 
     fn restore_hold(&self) -> Result<()> {
@@ -443,15 +481,15 @@ impl Store {
 
     fn recover_refresh(&self, state: &TransactionState) -> Result<()> {
         let Some(source) = state.recovery_source.as_deref() else {
-            return self.restore_hold();
+            return self.restore_active_if_held(state);
         };
         let Ok(fresh) = AuthDocument::read(source) else {
-            return self.restore_hold();
+            return self.restore_active_if_held(state);
         };
         let slot = if let Some(slot) = state.slot {
             let stored = AuthDocument::read(self.config.profile_auth(slot))?;
             if fresh.identity != stored.identity || fresh.same_credentials(&stored) {
-                return self.restore_hold();
+                return self.restore_active_if_held(state);
             }
             slot
         } else if let Some(existing) = self.slot_for_identity(&fresh.identity)? {
@@ -468,6 +506,7 @@ impl Store {
             activate: state.activate,
             select: state.select,
             link_session: state.link_session,
+            hold_active: state.hold_active,
             profile_pending: Some(pending),
             recovery_source: state.recovery_source.clone(),
         };
@@ -488,7 +527,7 @@ impl Store {
         }
         if state.activate {
             atomic_copy(&profile_path, &self.config.active_auth, 0o600)?;
-        } else {
+        } else if state.hold_active {
             self.restore_hold()?;
         }
         if state.select {
@@ -508,8 +547,10 @@ impl Store {
         if let Some(pending) = &state.profile_pending {
             remove_file_if_exists(pending)?;
         }
-        remove_file_if_exists(&self.config.active_pending())?;
-        remove_file_if_exists(&self.config.active_hold())?;
+        if state.hold_active {
+            remove_file_if_exists(&self.config.active_pending())?;
+            remove_file_if_exists(&self.config.active_hold())?;
+        }
         if let Some(source) = &state.recovery_source {
             self.cleanup_recovery_source(source)?;
         }
@@ -612,6 +653,7 @@ pub struct AuthBarrier {
     config: Config,
     finished: bool,
     irreversible: bool,
+    hold_active: bool,
 }
 
 impl AuthBarrier {
@@ -629,6 +671,7 @@ impl AuthBarrier {
             activate,
             select,
             link_session,
+            hold_active: self.hold_active,
             profile_pending: None,
             recovery_source: Some(source),
         };
@@ -639,7 +682,9 @@ impl AuthBarrier {
 
     pub fn rollback(mut self) -> Result<()> {
         let store = Store::new(self.config.clone());
-        store.restore_hold()?;
+        if self.hold_active {
+            store.restore_hold()?;
+        }
         remove_file_if_exists(&self.config.transaction_state())?;
         self.finished = true;
         Ok(())
@@ -655,6 +700,7 @@ impl AuthBarrier {
             activate: true,
             select: true,
             link_session,
+            hold_active: self.hold_active,
             profile_pending: None,
             recovery_source: None,
         };
@@ -684,12 +730,13 @@ impl AuthBarrier {
             activate,
             select,
             link_session,
+            hold_active: self.hold_active,
             profile_pending: Some(pending),
             recovery_source: Some(source.to_owned()),
         };
         write_state(&self.config.transaction_state(), &state)?;
         self.irreversible = true;
-        if writers_running(&self.config) {
+        if self.hold_active && writers_running(&self.config) {
             return Err(Error::RecoveryDeferred);
         }
         let store = Store::new(self.config.clone());
@@ -706,7 +753,9 @@ impl Drop for AuthBarrier {
             return;
         }
         let store = Store::new(self.config.clone());
-        let _ = store.restore_hold();
+        if self.hold_active {
+            let _ = store.restore_hold();
+        }
         let _ = remove_file_if_exists(&self.config.transaction_state());
     }
 }

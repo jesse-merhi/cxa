@@ -38,6 +38,8 @@ enum CliCommand {
         #[arg(allow_hyphen_values = true)]
         options: Vec<OsString>,
     },
+    /// Import an existing Codex auth.json file.
+    Import { auth_file: PathBuf },
     /// Re-authenticate an existing account.
     #[command(trailing_var_arg = true)]
     Relogin {
@@ -60,6 +62,7 @@ pub fn run(cli: Cli, config: Config) -> Result<()> {
         (Some(CliCommand::Status), _) | (None, None) => app.status(true),
         (Some(CliCommand::Use { account }), _) | (None, Some(account)) => app.switch(&account),
         (Some(CliCommand::Add { options }), _) => app.add(&options),
+        (Some(CliCommand::Import { auth_file }), _) => app.import(&auth_file),
         (Some(CliCommand::Relogin { account, options }), _) => app.relogin(&account, &options),
         (Some(CliCommand::Relink), _) => app.relink(),
         (Some(CliCommand::ServiceGuard), _) => app.service_guard(),
@@ -304,11 +307,8 @@ impl App {
         reject_non_oauth(options)?;
         self.recover_locked()?;
         let _lock = self.store.lock()?;
-        refuse_writers(&self.store.config)?;
-        self.store.sync_or_restore_selected()?;
         let mut login = StagedLogin::prepare(&self.store.config)?;
-        let mut barrier = self.store.begin_barrier()?;
-        barrier.mark_refreshing(None, login.auth_path().to_owned(), false, false, false)?;
+        let barrier = self.store.begin_enrollment(login.auth_path().to_owned())?;
         if let Err(error) = login.execute(options) {
             let revoke = login.revoke();
             barrier.rollback()?;
@@ -340,6 +340,24 @@ impl App {
         }
         login.accept();
         println!("\nEnrolled {} as account {slot}.", fresh.identity.email);
+        println!("Switch to it with: cxa {slot}");
+        Ok(())
+    }
+
+    fn import(&self, auth_file: &Path) -> Result<()> {
+        self.recover_locked()?;
+        let _lock = self.store.lock()?;
+        let imported = AuthDocument::read(auth_file)?;
+        if let Some(slot) = self.store.slot_for_identity(&imported.identity)? {
+            return Err(Error::Message(format!(
+                "{} is already enrolled as account {slot}; nothing was imported.",
+                imported.identity.email
+            )));
+        }
+        let slot = self.store.next_slot()?;
+        let barrier = self.store.begin_enrollment(auth_file.to_owned())?;
+        barrier.commit_profile(slot, auth_file, false, false, false)?;
+        println!("Imported {} as account {slot}.", imported.identity.email);
         println!("Switch to it with: cxa {slot}");
         Ok(())
     }

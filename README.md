@@ -50,9 +50,14 @@ Common commands:
 cxa list
 cxa status
 cxa use 2
+cxa import /path/to/auth.json
 cxa relogin 2
 cxa relink
 ```
+
+`cxa add` can enroll an account while Codex is running because OAuth is staged
+in an isolated home. `cxa import` copies and validates an existing Codex
+`auth.json`; it leaves the source and active credentials unchanged.
 
 `cxa list` refreshes quota only for the selected account. Inactive accounts
 show their last known usage; switch to one to refresh it.

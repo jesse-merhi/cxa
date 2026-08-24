@@ -48,6 +48,7 @@ fi
 set -euo pipefail
 if [[ ${1:-} == login ]]; then
   [[ ${CXA_TEST_REQUIRE_ACTIVE_MISSING:-0} != 1 || ! -e $CXA_ACTIVE_AUTH ]]
+  [[ ${CXA_TEST_REQUIRE_ACTIVE_PRESENT:-0} != 1 || -e $CXA_ACTIVE_AUTH ]]
   cp "$CXA_TEST_LOGIN_AUTH" "$CODEX_HOME/auth.json"
   exit "${CXA_TEST_LOGIN_EXIT:-0}"
 fi
@@ -179,6 +180,7 @@ fn write_refresh_transaction(
     source: &Path,
     activate: bool,
     link_session: bool,
+    hold_active: bool,
 ) {
     fs::write(
         case.store.join(".auth-transaction.json"),
@@ -188,6 +190,7 @@ fn write_refresh_transaction(
             "activate": activate,
             "select": false,
             "link_session": link_session,
+            "hold_active": hold_active,
             "profile_pending": null,
             "recovery_source": source,
         }))
@@ -273,7 +276,7 @@ fn a_running_writer_blocks_switch_without_changes() {
 }
 
 #[test]
-fn add_hides_active_auth_and_enrolls_the_login_identity() {
+fn add_while_writer_running_enrolls_without_touching_active_auth() {
     let case = Case::new();
     case.enroll(1, "one@example.com", "one", "account-one", "user-one");
     case.select(1);
@@ -290,7 +293,8 @@ fn add_hides_active_auth_and_enrolls_the_login_identity() {
     let output = case
         .command()
         .env("CXA_TEST_LOGIN_AUTH", &login)
-        .env("CXA_TEST_REQUIRE_ACTIVE_MISSING", "1")
+        .env("CXA_TEST_REQUIRE_ACTIVE_PRESENT", "1")
+        .env("CXA_TEST_WRITER_RUNNING", "1")
         .arg("add")
         .output()
         .unwrap();
@@ -301,6 +305,47 @@ fn add_hides_active_auth_and_enrolls_the_login_identity() {
     );
     assert_eq!(access_token(&case.profile(2).join("auth.json")), "two");
     assert_eq!(access_token(&case.active_auth), "one");
+    assert_eq!(
+        fs::read_to_string(case.store.join("active-profile")).unwrap(),
+        "1\n"
+    );
+}
+
+#[test]
+fn import_while_writer_running_copies_credentials_without_touching_the_source_or_active_auth() {
+    let case = Case::new();
+    case.enroll(1, "one@example.com", "one", "account-one", "user-one");
+    case.select(1);
+    let source = case.root.path().join("import.json");
+    write_auth(
+        &source,
+        "two@example.com",
+        "two",
+        "account-two",
+        "user-two",
+        2,
+    );
+    let source_before = fs::read(&source).unwrap();
+
+    let output = case
+        .command()
+        .env("CXA_TEST_WRITER_RUNNING", "1")
+        .arg("import")
+        .arg(&source)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(access_token(&case.profile(2).join("auth.json")), "two");
+    assert_eq!(access_token(&case.active_auth), "one");
+    assert_eq!(fs::read(&source).unwrap(), source_before);
+    assert_eq!(
+        fs::read_to_string(case.store.join("active-profile")).unwrap(),
+        "1\n"
+    );
 }
 
 #[test]
@@ -477,7 +522,7 @@ fn startup_recovers_rotated_credentials_from_an_interrupted_quota_refresh() {
         case.active_auth.with_extension("json.cxa-hold"),
     )
     .unwrap();
-    write_refresh_transaction(&case, Some(1), &source, true, false);
+    write_refresh_transaction(&case, Some(1), &source, true, false, true);
 
     let output = case.run(&["status"]);
     assert!(
@@ -492,7 +537,7 @@ fn startup_recovers_rotated_credentials_from_an_interrupted_quota_refresh() {
 }
 
 #[test]
-fn startup_finishes_an_interrupted_add_without_switching_accounts() {
+fn startup_finishes_an_interrupted_live_enrollment_without_switching_accounts() {
     let case = Case::new();
     case.enroll(1, "one@example.com", "one", "account-one", "user-one");
     case.select(1);
@@ -506,14 +551,14 @@ fn startup_finishes_an_interrupted_add_without_switching_accounts() {
         "user-two",
         2,
     );
-    fs::rename(
-        &case.active_auth,
-        case.active_auth.with_extension("json.cxa-hold"),
-    )
-    .unwrap();
-    write_refresh_transaction(&case, None, &source, false, false);
+    write_refresh_transaction(&case, None, &source, false, false, false);
 
-    let output = case.run(&["status"]);
+    let output = case
+        .command()
+        .env("CXA_TEST_WRITER_RUNNING", "1")
+        .arg("status")
+        .output()
+        .unwrap();
     assert!(
         output.status.success(),
         "{}",
