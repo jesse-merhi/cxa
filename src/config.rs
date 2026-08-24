@@ -103,12 +103,11 @@ fn env_path(name: &str) -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(target_os = "linux")))]
 mod tests {
     use super::*;
 
     #[test]
-    #[cfg(not(target_os = "linux"))]
     fn non_linux_shared_files_stay_in_the_account_store() {
         let store = Path::new("/users/example/.codex-auth");
         assert_eq!(default_active_auth(store), store.join("auth.json"));
