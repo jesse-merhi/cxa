@@ -59,12 +59,14 @@ cxa relink
 in an isolated home. `cxa import` copies and validates an existing Codex
 `auth.json`; it leaves the source and active credentials unchanged.
 
-`cxa list` refreshes quota only for the selected account. Inactive accounts
-show their last known usage; switch to one to refresh it.
+`cxa list` refreshes quota for every enrolled account without rotating saved
+tokens. If an inactive account's access token has expired, relogin to refresh
+its credentials.
 
-By default, account profiles live under `~/.codex-auth/profile-N`, the selected
-slot is stored in `~/.codex-auth/active-profile`, and the promoted credential
-is `/var/lib/codex-auth/auth.json`. These paths can be overridden with:
+By default, account profiles live under `~/.codex-auth/profile-N` and the
+selected slot is stored in `~/.codex-auth/active-profile`. On macOS the promoted
+credential is `~/.codex-auth/auth.json`; Linux service installations use
+`/var/lib/codex-auth/auth.json`. These paths can be overridden with:
 
 - `CXA_ACCOUNT_STORE`
 - `CXA_ACTIVE_AUTH`

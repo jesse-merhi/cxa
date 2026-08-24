@@ -230,6 +230,29 @@ impl Store {
             .filter(|slot| self.config.profile_dir(*slot).is_dir())
     }
 
+    pub fn adopt_detached_session_selection(&self) -> Result<()> {
+        if self.selected().is_some() {
+            return Ok(());
+        }
+        let Ok(metadata) = fs::symlink_metadata(&self.config.session_auth) else {
+            return Ok(());
+        };
+        if metadata.file_type().is_symlink() {
+            return Ok(());
+        }
+        let Ok(session) = AuthDocument::read(&self.config.session_auth) else {
+            return Ok(());
+        };
+        let Some(slot) = self.slot_for_identity(&session.identity)? else {
+            return Ok(());
+        };
+        atomic_write(
+            &self.config.active_profile,
+            format!("{slot}\n").as_bytes(),
+            0o600,
+        )
+    }
+
     pub fn resolve(&self, selector: &str) -> Result<Profile> {
         let profiles = self.profiles()?;
         if let Ok(slot) = selector.parse::<u32>() {
@@ -612,6 +635,12 @@ impl Store {
                 "Session credentials: linked to {}",
                 self.config.active_auth.display()
             ));
+        } else if self.detached_session_matches(&profile.identity) && writers_running(&self.config)
+        {
+            lines.push(
+                "Session credentials: live account matches the selection; relink after Codex stops to enable switching."
+                    .into(),
+            );
         } else if self.config.session_auth.exists() {
             lines.push(format!(
                 "Session credentials: DETACHED ({} is a real file). Run cxa relink.",
@@ -631,6 +660,9 @@ impl Store {
             .selected()
             .ok_or_else(|| Error::Message("No default Codex account is selected.".into()))?;
         let profile = AuthDocument::read(self.config.profile_auth(selected))?;
+        if self.detached_session_matches(&profile.identity) && writers_running(&self.config) {
+            return Ok(None);
+        }
         if fs::read_link(&self.config.session_auth).ok().as_deref()
             != Some(&self.config.active_auth)
             || !self.config.active_auth.is_file()
@@ -646,6 +678,15 @@ impl Store {
             ));
         }
         Ok(None)
+    }
+
+    fn detached_session_matches(&self, identity: &Identity) -> bool {
+        fs::symlink_metadata(&self.config.session_auth)
+            .ok()
+            .is_some_and(|metadata| !metadata.file_type().is_symlink())
+            && AuthDocument::read(&self.config.session_auth)
+                .ok()
+                .is_some_and(|session| session.identity == *identity)
     }
 }
 

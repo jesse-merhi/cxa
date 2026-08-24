@@ -1,5 +1,5 @@
 use std::env;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::{Error, Result};
 
@@ -23,12 +23,12 @@ impl Config {
             .map(PathBuf::from)
             .ok_or_else(|| Error::Message("HOME is not set".into()))?;
         let codex_home = env_path("CXA_CODEX_HOME").unwrap_or_else(|| home.join(".codex"));
-        let active_auth = env_path("CXA_ACTIVE_AUTH")
-            .unwrap_or_else(|| PathBuf::from("/var/lib/codex-auth/auth.json"));
         let account_store =
             env_path("CXA_ACCOUNT_STORE").unwrap_or_else(|| home.join(".codex-auth"));
+        let active_auth =
+            env_path("CXA_ACTIVE_AUTH").unwrap_or_else(|| default_active_auth(&account_store));
         let app_server_socket = env_path("CXA_SHARED_APP_SERVER_SOCKET")
-            .unwrap_or_else(|| PathBuf::from("/var/lib/codex-auth/app-server.sock"));
+            .unwrap_or_else(|| default_app_server_socket(&account_store));
         let usage_ttl_seconds = env::var("CXA_USAGE_TTL")
             .ok()
             .and_then(|value| value.parse().ok())
@@ -77,8 +77,44 @@ impl Config {
     }
 }
 
+#[cfg(target_os = "linux")]
+fn default_active_auth(_: &Path) -> PathBuf {
+    PathBuf::from("/var/lib/codex-auth/auth.json")
+}
+
+#[cfg(not(target_os = "linux"))]
+fn default_active_auth(account_store: &Path) -> PathBuf {
+    account_store.join("auth.json")
+}
+
+#[cfg(target_os = "linux")]
+fn default_app_server_socket(_: &Path) -> PathBuf {
+    PathBuf::from("/var/lib/codex-auth/app-server.sock")
+}
+
+#[cfg(not(target_os = "linux"))]
+fn default_app_server_socket(account_store: &Path) -> PathBuf {
+    account_store.join("app-server.sock")
+}
+
 fn env_path(name: &str) -> Option<PathBuf> {
     env::var_os(name)
         .filter(|value| !value.is_empty())
         .map(PathBuf::from)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    #[cfg(not(target_os = "linux"))]
+    fn non_linux_shared_files_stay_in_the_account_store() {
+        let store = Path::new("/users/example/.codex-auth");
+        assert_eq!(default_active_auth(store), store.join("auth.json"));
+        assert_eq!(
+            default_app_server_socket(store),
+            store.join("app-server.sock")
+        );
+    }
 }

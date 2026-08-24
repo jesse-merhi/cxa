@@ -8,7 +8,9 @@ use clap::{Parser, Subcommand};
 use tempfile::Builder;
 
 use crate::account_store::{Store, UsageRecord, now_epoch};
-use crate::app_server::{prepare_offline_home, query_offline, query_shared};
+use crate::app_server::{
+    prepare_offline_home, query_offline, query_offline_read_only, query_shared,
+};
 use crate::auth::AuthDocument;
 use crate::config::Config;
 use crate::fs::{private_dir, remove_file_if_exists};
@@ -129,18 +131,19 @@ impl App {
     fn list(&self) -> Result<()> {
         self.recover_locked()?;
         let _lock = self.store.lock()?;
+        self.store.adopt_detached_session_selection()?;
         if !writers_running(&self.store.config) {
             self.store.sync_active_to_profile()?;
-        }
-        let selected = self.store.selected();
-        if let Some(slot) = selected {
-            self.refresh_usage(slot)?;
         }
         let profiles = self.store.profiles()?;
         if profiles.is_empty() {
             println!("No Codex accounts are enrolled. Run `cxa add`.");
             return Ok(());
         }
+        for profile in &profiles {
+            self.refresh_usage(profile.slot)?;
+        }
+        let selected = self.store.selected();
         let width = profiles
             .iter()
             .map(|profile| profile.auth.identity.email.len())
@@ -164,7 +167,7 @@ impl App {
         }
         if profiles.len() > 1 {
             println!(
-                "Usage refreshes only for the selected account; switch accounts to refresh another account's usage."
+                "Usage refreshes without switching; relogin an account if its saved access token has expired."
             );
         }
         Ok(())
@@ -173,6 +176,7 @@ impl App {
     fn status(&self, refresh: bool) -> Result<()> {
         self.recover_locked()?;
         let _lock = self.store.lock()?;
+        self.store.adopt_detached_session_selection()?;
         if !writers_running(&self.store.config) {
             self.store.sync_active_to_profile()?;
         }
@@ -197,21 +201,30 @@ impl App {
         }
         let previous = self.store.usage(slot);
         if writers_running(config) {
-            if !config.app_server_socket.exists() {
+            if config.app_server_socket.exists()
+                && AuthDocument::read(&config.active_auth)
+                    .ok()
+                    .and_then(|active| {
+                        self.store
+                            .slot_for_identity(&active.identity)
+                            .ok()
+                            .flatten()
+                    })
+                    == Some(slot)
+            {
+                touch_private(&config.usage_attempt(slot))?;
+                let result = query_shared(&config.app_server_socket);
+                write_usage_result(
+                    previous.as_ref(),
+                    &result.usage,
+                    &config.profile_usage(slot),
+                )?;
                 return Ok(());
             }
-            let active = AuthDocument::read(&config.active_auth)?;
-            if self.store.slot_for_identity(&active.identity)? != Some(slot) {
-                return Ok(());
-            }
-            touch_private(&config.usage_attempt(slot))?;
-            let result = query_shared(&config.app_server_socket);
-            write_usage_result(
-                previous.as_ref(),
-                &result.usage,
-                &config.profile_usage(slot),
-            )?;
-            return Ok(());
+            return self.refresh_usage_read_only(slot, previous.as_ref());
+        }
+        if self.store.selected() != Some(slot) {
+            return self.refresh_usage_read_only(slot, previous.as_ref());
         }
 
         touch_private(&config.usage_attempt(slot))?;
@@ -301,6 +314,15 @@ impl App {
         }
         println!("New Codex launches will use this account; session history remains shared.");
         Ok(())
+    }
+
+    fn refresh_usage_read_only(&self, slot: u32, previous: Option<&UsageRecord>) -> Result<()> {
+        let config = &self.store.config;
+        touch_private(&config.usage_attempt(slot))?;
+        let source = config.profile_auth(slot);
+        let home = prepare_offline_home(config, &source)?;
+        let result = query_offline_read_only(home.path());
+        write_usage_result(previous, &result.usage, &config.profile_usage(slot))
     }
 
     fn add(&self, options: &[OsString]) -> Result<()> {

@@ -64,7 +64,8 @@ while IFS= read -r line; do
     *'"method":"initialized"'*) ;;
     *'"method":"account/read"'*)
       [[ ${CXA_TEST_REQUIRE_ACTIVE_MISSING:-0} != 1 || ! -e $CXA_ACTIVE_AUTH ]]
-      if [[ -n ${CXA_TEST_REFRESH_AUTH:-} ]]; then
+      if [[ $line == *'"refreshToken":true'* && -n ${CXA_TEST_REFRESH_AUTH:-} ]]; then
+        [[ -z ${CXA_TEST_REFRESH_MARKER:-} ]] || touch "$CXA_TEST_REFRESH_MARKER"
         cp "$CXA_TEST_REFRESH_AUTH" "$CODEX_HOME/auth.json"
       fi
       printf '%s\n' '{"id":1,"result":{"account":{"type":"chatgpt"},"requiresOpenaiAuth":true}}'
@@ -200,7 +201,7 @@ fn write_refresh_transaction(
 }
 
 #[test]
-fn multi_account_list_explains_that_inactive_usage_is_cached() {
+fn multi_account_list_explains_read_only_usage_refresh() {
     let case = Case::new();
     case.enroll(1, "one@example.com", "one", "account-one", "user-one");
     case.enroll(2, "two@example.com", "two", "account-two", "user-two");
@@ -226,8 +227,85 @@ fn multi_account_list_explains_that_inactive_usage_is_cached() {
     assert!(stdout.contains("two@example.com"));
     assert!(stdout.contains("primary 70% used"));
     assert!(stdout.contains(
-        "Usage refreshes only for the selected account; switch accounts to refresh another account's usage."
+        "Usage refreshes without switching; relogin an account if its saved access token has expired."
     ));
+}
+
+#[test]
+fn list_adopts_the_matching_detached_live_session_without_changing_it() {
+    let case = Case::new();
+    case.enroll(1, "one@example.com", "one", "account-one", "user-one");
+    case.enroll(2, "two@example.com", "two", "account-two", "user-two");
+    let session = case.codex_home.join("auth.json");
+    write_auth(
+        &session,
+        "two@example.com",
+        "live-two",
+        "account-two",
+        "user-two",
+        2,
+    );
+
+    let output = case
+        .command()
+        .env("CXA_TEST_WRITER_RUNNING", "1")
+        .arg("list")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("* 2  two@example.com"));
+    assert_eq!(
+        fs::read_to_string(case.store.join("active-profile")).unwrap(),
+        "2\n"
+    );
+    assert_eq!(access_token(&session), "live-two");
+    assert!(!case.active_auth.exists());
+}
+
+#[test]
+fn list_reads_all_account_quotas_without_refreshing_credentials_while_codex_runs() {
+    let case = Case::new();
+    case.enroll(1, "one@example.com", "one", "account-one", "user-one");
+    case.enroll(2, "two@example.com", "two", "account-two", "user-two");
+    case.select(1);
+    let refresh_marker = case.root.path().join("refreshed-token");
+    let refreshed = case.root.path().join("refreshed.json");
+    write_auth(
+        &refreshed,
+        "one@example.com",
+        "rotated",
+        "account-one",
+        "user-one",
+        2,
+    );
+
+    let output = case
+        .command()
+        .env("CXA_TEST_WRITER_RUNNING", "1")
+        .env("CXA_SKIP_USAGE_REFRESH", "0")
+        .env("CXA_USAGE_TTL", "0")
+        .env("CXA_TEST_REFRESH_AUTH", &refreshed)
+        .env("CXA_TEST_REFRESH_MARKER", &refresh_marker)
+        .arg("list")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(stdout.matches("primary 25% used").count(), 2);
+    assert!(case.profile(1).join("usage.json").is_file());
+    assert!(case.profile(2).join("usage.json").is_file());
+    assert_eq!(access_token(&case.profile(1).join("auth.json")), "one");
+    assert_eq!(access_token(&case.profile(2).join("auth.json")), "two");
+    assert_eq!(access_token(&case.active_auth), "one");
+    assert!(!refresh_marker.exists());
 }
 
 #[test]
@@ -748,6 +826,38 @@ fn status_reports_a_missing_session_link_as_unhealthy() {
     let output = case.run(&["status"]);
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stdout).contains("Session credentials: MISSING"));
+}
+
+#[test]
+fn status_accepts_a_matching_detached_session_while_codex_runs() {
+    let case = Case::new();
+    case.enroll(1, "one@example.com", "one", "account-one", "user-one");
+    let session = case.codex_home.join("auth.json");
+    write_auth(
+        &session,
+        "one@example.com",
+        "live-one",
+        "account-one",
+        "user-one",
+        2,
+    );
+
+    let output = case
+        .command()
+        .env("CXA_TEST_WRITER_RUNNING", "1")
+        .arg("status")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("Default Codex account: 1  one@example.com"));
+    assert!(stdout.contains("matches the selection; relink after Codex stops"));
+    assert_eq!(access_token(&session), "live-one");
+    assert!(!case.active_auth.exists());
 }
 
 #[test]

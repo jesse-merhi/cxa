@@ -56,6 +56,14 @@ pub fn prepare_offline_home(config: &Config, source_auth: &Path) -> Result<tempf
 }
 
 pub fn query_offline(home: &Path) -> QuotaResult {
+    query_spawned(home, true)
+}
+
+pub fn query_offline_read_only(home: &Path) -> QuotaResult {
+    query_spawned(home, false)
+}
+
+fn query_spawned(home: &Path, refresh_token: bool) -> QuotaResult {
     let mut client = match SpawnedClient::start(home) {
         Ok(client) => client,
         Err(error) => {
@@ -65,9 +73,11 @@ pub fn query_offline(home: &Path) -> QuotaResult {
             };
         }
     };
-    let usage = query(&mut client, true);
+    let usage = query(&mut client, refresh_token);
     let refreshed = client.finish();
-    let refreshed_auth = refreshed.as_ref().ok().cloned().flatten();
+    let refreshed_auth = refresh_token
+        .then(|| refreshed.as_ref().ok().cloned().flatten())
+        .flatten();
     let usage = match (usage, refreshed) {
         (Ok(usage), Ok(_)) => usage,
         (Err(error), _) | (Ok(_), Err(error)) => unavailable(&error),
