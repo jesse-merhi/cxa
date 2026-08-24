@@ -411,6 +411,21 @@ mod tests {
     use std::os::unix::net::UnixListener;
     use tempfile::tempdir;
 
+    #[allow(clippy::result_large_err)]
+    fn select_codex_subprotocol(
+        _: &tungstenite::handshake::server::Request,
+        mut response: tungstenite::handshake::server::Response,
+    ) -> std::result::Result<
+        tungstenite::handshake::server::Response,
+        tungstenite::handshake::server::ErrorResponse,
+    > {
+        response.headers_mut().insert(
+            tungstenite::http::header::SEC_WEBSOCKET_PROTOCOL,
+            tungstenite::http::HeaderValue::from_static("codex-app-server"),
+        );
+        Ok(response)
+    }
+
     #[test]
     fn parses_all_quota_windows_and_exhaustion() {
         let record = parse_usage(&json!({"rateLimits": {
@@ -437,18 +452,7 @@ mod tests {
         let listener = UnixListener::bind(&socket).unwrap();
         let server = std::thread::spawn(move || {
             let (stream, _) = listener.accept().unwrap();
-            let mut websocket = tungstenite::accept_hdr(
-                stream,
-                |_: &tungstenite::handshake::server::Request,
-                 mut response: tungstenite::handshake::server::Response| {
-                    response.headers_mut().insert(
-                        tungstenite::http::header::SEC_WEBSOCKET_PROTOCOL,
-                        tungstenite::http::HeaderValue::from_static("codex-app-server"),
-                    );
-                    Ok(response)
-                },
-            )
-            .unwrap();
+            let mut websocket = tungstenite::accept_hdr(stream, select_codex_subprotocol).unwrap();
             let initialize: Value =
                 serde_json::from_str(&websocket.read().unwrap().into_text().unwrap()).unwrap();
             assert_eq!(initialize["method"], "initialize");

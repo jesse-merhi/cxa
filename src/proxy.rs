@@ -395,6 +395,21 @@ mod tests {
     use std::sync::mpsc;
     use tempfile::tempdir;
 
+    #[allow(clippy::result_large_err)]
+    fn select_codex_subprotocol(
+        _: &tungstenite::handshake::server::Request,
+        mut response: tungstenite::handshake::server::Response,
+    ) -> std::result::Result<
+        tungstenite::handshake::server::Response,
+        tungstenite::handshake::server::ErrorResponse,
+    > {
+        response.headers_mut().insert(
+            tungstenite::http::header::SEC_WEBSOCKET_PROTOCOL,
+            tungstenite::http::HeaderValue::from_static("codex-app-server"),
+        );
+        Ok(response)
+    }
+
     #[test]
     fn forwards_only_account_and_quota_methods() {
         let mut pending = HashSet::new();
@@ -472,18 +487,7 @@ mod tests {
             stream
                 .set_read_timeout(Some(Duration::from_millis(250)))
                 .unwrap();
-            let mut websocket = tungstenite::accept_hdr(
-                stream,
-                |_: &tungstenite::handshake::server::Request,
-                 mut response: tungstenite::handshake::server::Response| {
-                    response.headers_mut().insert(
-                        tungstenite::http::header::SEC_WEBSOCKET_PROTOCOL,
-                        tungstenite::http::HeaderValue::from_static("codex-app-server"),
-                    );
-                    Ok(response)
-                },
-            )
-            .unwrap();
+            let mut websocket = tungstenite::accept_hdr(stream, select_codex_subprotocol).unwrap();
             let first = websocket.read().unwrap().into_text().unwrap();
             let second = websocket.read().unwrap().into_text().unwrap();
             let first: Value = serde_json::from_str(&first).unwrap();
