@@ -8,6 +8,7 @@ cargo fmt -- --check
 cargo clippy --locked --all-targets -- -D warnings
 cargo test --locked --all-targets
 cargo build --locked --bins
+./scripts/check-homebrew-formula.sh
 
 if [[ "$(uname -s)" == "Linux" ]] && command -v systemd-analyze >/dev/null 2>&1; then
   verify_dir="$(mktemp -d)"

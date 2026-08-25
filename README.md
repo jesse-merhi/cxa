@@ -15,6 +15,12 @@ The repository also includes an optional Linux service setup:
 
 ## Install
 
+Install with Homebrew:
+
+```sh
+brew install jesse-merhi/tap/cxa
+```
+
 Install the CLI from source:
 
 ```sh
@@ -161,7 +167,8 @@ cargo build --locked --release --bins
 Pull requests run formatting, clippy with warnings denied, the full test suite,
 and binary builds on Linux and macOS. Pushing a tag matching the Cargo version,
 such as `v0.1.0`, runs the same checks and publishes release archives with
-checksums.
+checksums. Stable releases also update `Formula/cxa.rb` in
+[`jesse-merhi/homebrew-tap`](https://github.com/jesse-merhi/homebrew-tap).
 
 ## License
 

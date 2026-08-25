@@ -1,0 +1,36 @@
+class Cxa < Formula
+  desc "Fast, crash-safe account switcher for Codex ChatGPT OAuth accounts"
+  homepage "https://github.com/jesse-merhi/cxa"
+  version "@VERSION@"
+  license "MIT"
+
+  on_macos do
+    on_arm do
+      url "https://github.com/jesse-merhi/cxa/releases/download/v@VERSION@/cxa-macos-aarch64.tar.gz"
+      sha256 "@MACOS_AARCH64_SHA256@"
+    end
+    on_intel do
+      url "https://github.com/jesse-merhi/cxa/releases/download/v@VERSION@/cxa-macos-x86_64.tar.gz"
+      sha256 "@MACOS_X86_64_SHA256@"
+    end
+  end
+
+  on_linux do
+    on_arm do
+      url "https://github.com/jesse-merhi/cxa/releases/download/v@VERSION@/cxa-linux-aarch64.tar.gz"
+      sha256 "@LINUX_AARCH64_SHA256@"
+    end
+    on_intel do
+      url "https://github.com/jesse-merhi/cxa/releases/download/v@VERSION@/cxa-linux-x86_64.tar.gz"
+      sha256 "@LINUX_X86_64_SHA256@"
+    end
+  end
+
+  def install
+    bin.install "cxa"
+  end
+
+  test do
+    assert_match "cxa #{version}", shell_output("#{bin}/cxa --version")
+  end
+end
