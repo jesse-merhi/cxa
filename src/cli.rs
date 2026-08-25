@@ -1,9 +1,11 @@
 use std::ffi::OsString;
 use std::fs::{self, OpenOptions};
-use std::io::Write;
+use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
+use anstream::{eprintln, print, println};
+use anstyle::Style;
 use clap::{Parser, Subcommand};
 use tempfile::Builder;
 
@@ -15,6 +17,7 @@ use crate::auth::AuthDocument;
 use crate::config::Config;
 use crate::fs::{private_dir, remove_file_if_exists};
 use crate::process::{WriterStatus, codex_writer_status, writers_running};
+use crate::terminal::{ACCENT, EMPHASIS, ERROR, MUTED, SUCCESS, WARNING};
 use crate::{Error, Result};
 
 #[derive(Debug, Parser)]
@@ -28,6 +31,12 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum CliCommand {
+    /// Import the current Codex login and select it as the first account.
+    Init {
+        /// Import without asking for confirmation.
+        #[arg(long)]
+        yes: bool,
+    },
     /// List enrolled accounts and their last known quota.
     List,
     /// Show the selected account and shared credential state.
@@ -60,6 +69,7 @@ enum CliCommand {
 pub fn run(cli: Cli, config: Config) -> Result<()> {
     let app = App::new(config);
     match (cli.command, cli.account) {
+        (Some(CliCommand::Init { yes }), _) => app.init(yes),
         (Some(CliCommand::List), _) => app.list(),
         (Some(CliCommand::Status), _) | (None, None) => app.status(true),
         (Some(CliCommand::Use { account }), _) | (None, Some(account)) => app.switch(&account),
@@ -128,6 +138,116 @@ impl App {
         Ok(())
     }
 
+    fn init(&self, assume_yes: bool) -> Result<()> {
+        self.recover_locked()?;
+        let _lock = self.store.lock()?;
+        self.store.adopt_detached_session_selection()?;
+
+        let profiles = self.store.profiles()?;
+        if !profiles.is_empty() {
+            if let Some(selected) = self.store.selected() {
+                let profile = self.store.resolve(&selected.to_string())?;
+                println!(
+                    "{SUCCESS}✓{SUCCESS:#} cxa is already initialized with account {ACCENT}{selected}{ACCENT:#} ({EMPHASIS}{}{EMPHASIS:#}).",
+                    profile.auth.identity.email
+                );
+                return Ok(());
+            }
+            return Err(Error::Message(
+                "cxa already has enrolled accounts, but none is selected. Run `cxa list`, then select one with `cxa <account>`."
+                    .into(),
+            ));
+        }
+
+        let session_path = &self.store.config.session_auth;
+        if !session_path.is_file() {
+            return Err(Error::Message(
+                "No current Codex login was found. Run `codex login`, then run `cxa init`.".into(),
+            ));
+        }
+        let current = AuthDocument::read(session_path)?;
+        if !assume_yes {
+            if !io::stdin().is_terminal() {
+                return Err(Error::Message(format!(
+                    "Found the current Codex login: {}. Run `cxa init --yes` to import it non-interactively.",
+                    current.identity.email
+                )));
+            }
+            print!(
+                "{ACCENT}?{ACCENT:#} Found the current Codex login: {EMPHASIS}{}{EMPHASIS:#}\n  Import it as account {ACCENT}1{ACCENT:#}? {MUTED}[Y/n]{MUTED:#} ",
+                current.identity.email
+            );
+            io::stdout()
+                .flush()
+                .map_err(|error| Error::io("stdout", error))?;
+            let mut answer = String::new();
+            io::stdin()
+                .read_line(&mut answer)
+                .map_err(|error| Error::io("stdin", error))?;
+            match answer.trim().to_ascii_lowercase().as_str() {
+                "" | "y" | "yes" => {}
+                "n" | "no" => {
+                    println!("{MUTED}Initialization cancelled.{MUTED:#}");
+                    return Ok(());
+                }
+                _ => {
+                    return Err(Error::Message(
+                        "Expected yes or no; nothing was changed.".into(),
+                    ));
+                }
+            }
+        }
+
+        let slot = self.store.next_slot()?;
+        let barrier = self.store.begin_enrollment(session_path.to_owned())?;
+        barrier.commit_profile(slot, session_path, true, true, false)?;
+
+        let linked = if writers_running(&self.store.config) {
+            false
+        } else {
+            match self
+                .store
+                .begin_barrier()
+                .and_then(|barrier| barrier.commit_switch(slot, true))
+            {
+                Ok(()) => true,
+                Err(Error::WriterRunning) => false,
+                Err(error) => return Err(error),
+            }
+        };
+
+        self.refresh_usage(slot)?;
+        println!(
+            "{SUCCESS}✓{SUCCESS:#} Imported {EMPHASIS}{}{EMPHASIS:#} as account {ACCENT}{slot}{ACCENT:#}.",
+            current.identity.email
+        );
+        println!("{SUCCESS}✓{SUCCESS:#} Account {ACCENT}{slot}{ACCENT:#} is now selected.");
+        let usage = self
+            .store
+            .usage(slot)
+            .map(|usage| usage.label(now_epoch()))
+            .unwrap_or_else(|| "usage unknown".into());
+        let usage_style = usage_style(&usage);
+        println!("{ACCENT}Quota{ACCENT:#}: {usage_style}{usage}{usage_style:#}");
+        if !linked {
+            println!(
+                "{WARNING}!{WARNING:#} Codex is running, so its live credentials were left untouched; run {ACCENT}cxa relink{ACCENT:#} after Codex stops to enable switching."
+            );
+        }
+        println!("{MUTED}Next:{MUTED:#} add another account with {ACCENT}cxa add{ACCENT:#}");
+        Ok(())
+    }
+
+    fn initialization_guidance(&self) -> String {
+        match AuthDocument::read(&self.store.config.session_auth) {
+            Ok(current) => format!(
+                "Found the current Codex login: {}\ncxa is not initialized. Run: cxa init",
+                current.identity.email
+            ),
+            Err(_) => "cxa is not initialized. Run `codex login`, then run `cxa init`.".into(),
+        }
+    }
+
     fn list(&self) -> Result<()> {
         self.recover_locked()?;
         let _lock = self.store.lock()?;
@@ -137,7 +257,7 @@ impl App {
         }
         let profiles = self.store.profiles()?;
         if profiles.is_empty() {
-            println!("No Codex accounts are enrolled. Run `cxa add`.");
+            println!("{}", self.initialization_guidance());
             return Ok(());
         }
         for profile in &profiles {
@@ -150,6 +270,11 @@ impl App {
             .max()
             .unwrap_or_default();
         for profile in &profiles {
+            let selected_style = if Some(profile.slot) == selected {
+                SUCCESS
+            } else {
+                Style::new()
+            };
             let marker = if Some(profile.slot) == selected {
                 '*'
             } else {
@@ -160,14 +285,15 @@ impl App {
                 .usage(profile.slot)
                 .map(|usage| usage.label(now_epoch()))
                 .unwrap_or_else(|| "usage unknown".into());
+            let usage_style = usage_style(&usage);
             println!(
-                "{marker} {}  {:width$}  {usage}",
+                "{selected_style}{marker}{selected_style:#} {ACCENT}{}{ACCENT:#}  {EMPHASIS}{:width$}{EMPHASIS:#}  {usage_style}{usage}{usage_style:#}",
                 profile.slot, profile.auth.identity.email
             );
         }
         if profiles.len() > 1 {
             println!(
-                "Usage refreshes without switching; relogin an account if its saved access token has expired."
+                "{MUTED}Usage refreshes without switching; relogin an account if its saved access token has expired.{MUTED:#}"
             );
         }
         Ok(())
@@ -177,6 +303,9 @@ impl App {
         self.recover_locked()?;
         let _lock = self.store.lock()?;
         self.store.adopt_detached_session_selection()?;
+        if self.store.profiles()?.is_empty() {
+            return Err(Error::Message(self.initialization_guidance()));
+        }
         if !writers_running(&self.store.config) {
             self.store.sync_active_to_profile()?;
         }
@@ -186,7 +315,7 @@ impl App {
             }
         }
         for line in self.store.status_lines()? {
-            println!("{line}");
+            print_status_line(&line);
         }
         if let Some(issue) = self.store.status_issue()? {
             return Err(Error::Message(issue));
@@ -276,7 +405,7 @@ impl App {
             ),
             Err(Error::RecoveryDeferred) => {
                 eprintln!(
-                    "Codex started after OAuth rotation; refreshed credentials will commit after it exits."
+                    "{WARNING}!{WARNING:#} Codex started after OAuth rotation; refreshed credentials will commit after it exits."
                 );
                 Ok(())
             }
@@ -298,7 +427,7 @@ impl App {
             .is_some_and(|usage| usage.exhausted_now(now_epoch()))
         {
             eprintln!(
-                "WARNING: account {} ({}) was last seen exhausted -- {}",
+                "{WARNING}warning{WARNING:#}: account {ACCENT}{}{ACCENT:#} ({EMPHASIS}{}{EMPHASIS:#}) was last seen exhausted -- {ERROR}{}{ERROR:#}",
                 target.slot,
                 target.auth.identity.email,
                 self.store.usage(target.slot).unwrap().label(now_epoch())
@@ -310,9 +439,11 @@ impl App {
         barrier.commit_switch(target.slot, true)?;
         propagate_codex_home(&self.store.config);
         for line in self.store.status_lines()? {
-            println!("{line}");
+            print_status_line(&line);
         }
-        println!("New Codex launches will use this account; session history remains shared.");
+        println!(
+            "{SUCCESS}✓{SUCCESS:#} New Codex launches will use this account; session history remains shared."
+        );
         Ok(())
     }
 
@@ -361,8 +492,11 @@ impl App {
             return Err(error);
         }
         login.accept();
-        println!("\nEnrolled {} as account {slot}.", fresh.identity.email);
-        println!("Switch to it with: cxa {slot}");
+        println!(
+            "\n{SUCCESS}✓{SUCCESS:#} Enrolled {EMPHASIS}{}{EMPHASIS:#} as account {ACCENT}{slot}{ACCENT:#}.",
+            fresh.identity.email
+        );
+        println!("{MUTED}Next:{MUTED:#} switch to it with {ACCENT}cxa {slot}{ACCENT:#}");
         Ok(())
     }
 
@@ -379,8 +513,11 @@ impl App {
         let slot = self.store.next_slot()?;
         let barrier = self.store.begin_enrollment(auth_file.to_owned())?;
         barrier.commit_profile(slot, auth_file, false, false, false)?;
-        println!("Imported {} as account {slot}.", imported.identity.email);
-        println!("Switch to it with: cxa {slot}");
+        println!(
+            "{SUCCESS}✓{SUCCESS:#} Imported {EMPHASIS}{}{EMPHASIS:#} as account {ACCENT}{slot}{ACCENT:#}.",
+            imported.identity.email
+        );
+        println!("{MUTED}Next:{MUTED:#} switch to it with {ACCENT}cxa {slot}{ACCENT:#}");
         Ok(())
     }
 
@@ -393,7 +530,7 @@ impl App {
         let target = self.store.resolve(selector)?;
         let selected = self.store.selected();
         println!(
-            "Re-authenticating account {} ({}). The shared session stays on the current account.\n",
+            "{ACCENT}Re-authenticating account {}{ACCENT:#} ({EMPHASIS}{}{EMPHASIS:#}). {MUTED}The shared session stays on the current account.{MUTED:#}\n",
             target.slot, target.auth.identity.email
         );
         let mut login = StagedLogin::prepare(&self.store.config)?;
@@ -442,7 +579,7 @@ impl App {
             Err(Error::RecoveryDeferred) => {
                 login.accept();
                 eprintln!(
-                    "Codex started after OAuth rotation; refreshed credentials will commit after it exits."
+                    "{WARNING}!{WARNING:#} Codex started after OAuth rotation; refreshed credentials will commit after it exits."
                 );
                 return Ok(());
             }
@@ -456,12 +593,12 @@ impl App {
         remove_file_if_exists(&self.store.config.usage_attempt(target.slot))?;
         if activate {
             println!(
-                "Account {} is selected, so the shared active credentials were updated too.",
+                "{SUCCESS}✓{SUCCESS:#} Account {ACCENT}{}{ACCENT:#} is selected, so the shared active credentials were updated too.",
                 target.slot
             );
         }
         println!(
-            "\nRe-authenticated {} as account {}.",
+            "\n{SUCCESS}✓{SUCCESS:#} Re-authenticated {EMPHASIS}{}{EMPHASIS:#} as account {ACCENT}{}{ACCENT:#}.",
             fresh.identity.email, target.slot
         );
         Ok(())
@@ -480,7 +617,7 @@ impl App {
         let barrier = self.store.begin_barrier()?;
         barrier.commit_switch(selected, true)?;
         for line in self.store.status_lines()? {
-            println!("{line}");
+            print_status_line(&line);
         }
         Ok(())
     }
@@ -524,6 +661,43 @@ impl App {
     }
 }
 
+fn usage_style(label: &str) -> Style {
+    if label.contains("EXHAUSTED") || label.contains("100% used") {
+        return ERROR;
+    }
+    let primary_percent = label
+        .split_whitespace()
+        .find_map(|word| word.strip_suffix('%'))
+        .and_then(|percent| percent.parse::<u8>().ok());
+    if label.contains("unknown") || primary_percent.is_some_and(|percent| percent >= 80) {
+        WARNING
+    } else {
+        SUCCESS
+    }
+}
+
+fn print_status_line(line: &str) {
+    let Some((label, value)) = line.split_once(": ") else {
+        println!("{line}");
+        return;
+    };
+    let value_style = match label {
+        "Default Codex account" => EMPHASIS,
+        "Quota" => usage_style(value),
+        "Session credentials"
+            if value.contains("DETACHED")
+                || value.contains("MISSING")
+                || value.contains("does not match") =>
+        {
+            WARNING
+        }
+        "Session credentials" => SUCCESS,
+        "Active credentials" if value.contains("does not match") => WARNING,
+        _ => Style::new(),
+    };
+    println!("{ACCENT}{label}{ACCENT:#}: {value_style}{value}{value_style:#}");
+}
+
 fn write_usage_result(
     previous: Option<&UsageRecord>,
     next: &UsageRecord,
@@ -555,7 +729,7 @@ fn refuse_writers(config: &Config) -> Result<()> {
     }
     if config.app_server_socket.exists() {
         eprintln!(
-            "Stop the codex-quota-proxy socket, then the codex-shared-app-server service, before changing credentials."
+            "{WARNING}!{WARNING:#} Stop the codex-quota-proxy socket, then the codex-shared-app-server service, before changing credentials."
         );
     }
     Err(Error::WriterRunning)

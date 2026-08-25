@@ -1065,3 +1065,196 @@ fn failed_profile_promotion_preserves_rotated_auth_for_recovery() {
     assert_eq!(access_token(&case.active_auth), "rotated");
     assert!(!case.store.join(".auth-transaction.json").exists());
 }
+
+#[test]
+fn bare_command_recommends_init_for_a_current_codex_login() {
+    let case = Case::new();
+    let session = case.codex_home.join("auth.json");
+    write_auth(
+        &session,
+        "current@example.com",
+        "current",
+        "account-current",
+        "user-current",
+        1,
+    );
+
+    let output = case.run(&[]);
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("Found the current Codex login: current@example.com"));
+    assert!(stderr.contains("Run: cxa init"));
+    assert!(!case.profile(1).exists());
+}
+
+#[test]
+fn init_requires_confirmation_when_stdin_is_not_interactive() {
+    let case = Case::new();
+    write_auth(
+        &case.codex_home.join("auth.json"),
+        "current@example.com",
+        "current",
+        "account-current",
+        "user-current",
+        1,
+    );
+
+    let output = case.run(&["init"]);
+
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("cxa init --yes"));
+    assert!(!case.profile(1).exists());
+}
+
+#[test]
+fn init_imports_selects_and_links_the_current_codex_login() {
+    let case = Case::new();
+    let session = case.codex_home.join("auth.json");
+    write_auth(
+        &session,
+        "current@example.com",
+        "current",
+        "account-current",
+        "user-current",
+        1,
+    );
+
+    let output = case.run(&["init", "--yes"]);
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("Imported current@example.com as account 1."));
+    assert!(stdout.contains("Account 1 is now selected."));
+    assert_eq!(
+        fs::read_to_string(case.store.join("active-profile")).unwrap(),
+        "1\n"
+    );
+    assert_eq!(access_token(&case.profile(1).join("auth.json")), "current");
+    assert_eq!(access_token(&case.active_auth), "current");
+    assert_eq!(fs::read_link(&session).unwrap(), case.active_auth);
+}
+
+#[test]
+fn init_leaves_a_running_codex_session_detached_and_is_idempotent() {
+    let case = Case::new();
+    let session = case.codex_home.join("auth.json");
+    write_auth(
+        &session,
+        "current@example.com",
+        "current",
+        "account-current",
+        "user-current",
+        1,
+    );
+    let before = fs::read(&session).unwrap();
+
+    let output = case
+        .command()
+        .env("CXA_TEST_WRITER_RUNNING", "1")
+        .args(["init", "--yes"])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !fs::symlink_metadata(&session)
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+    assert_eq!(fs::read(&session).unwrap(), before);
+    assert_eq!(access_token(&case.profile(1).join("auth.json")), "current");
+    assert_eq!(access_token(&case.active_auth), "current");
+    assert_eq!(
+        fs::read_to_string(case.store.join("active-profile")).unwrap(),
+        "1\n"
+    );
+
+    let repeated = case
+        .command()
+        .env("CXA_TEST_WRITER_RUNNING", "1")
+        .args(["init", "--yes"])
+        .output()
+        .unwrap();
+    assert!(
+        repeated.status.success(),
+        "{}",
+        String::from_utf8_lossy(&repeated.stderr)
+    );
+    assert!(String::from_utf8_lossy(&repeated.stdout).contains("cxa is already initialized"));
+    assert!(!case.profile(2).exists());
+}
+
+#[test]
+fn init_explains_how_to_create_a_codex_login() {
+    let case = Case::new();
+
+    let output = case.run(&["init", "--yes"]);
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("No current Codex login was found."));
+    assert!(stderr.contains("codex login"));
+}
+
+#[test]
+fn terminal_colour_can_be_forced_for_status_and_errors() {
+    let case = Case::new();
+    write_auth(
+        &case.codex_home.join("auth.json"),
+        "current@example.com",
+        "current",
+        "account-current",
+        "user-current",
+        1,
+    );
+
+    let error = case
+        .command()
+        .env_remove("NO_COLOR")
+        .env("CLICOLOR_FORCE", "1")
+        .output()
+        .unwrap();
+    assert!(!error.status.success());
+    assert!(String::from_utf8_lossy(&error.stderr).contains("\u{1b}["));
+
+    case.enroll(
+        1,
+        "current@example.com",
+        "current",
+        "account-current",
+        "user-current",
+    );
+    case.select(1);
+    let list = case
+        .command()
+        .env_remove("NO_COLOR")
+        .env("CLICOLOR_FORCE", "1")
+        .arg("list")
+        .output()
+        .unwrap();
+    assert!(list.status.success());
+    assert!(String::from_utf8_lossy(&list.stdout).contains("\u{1b}["));
+}
+
+#[test]
+fn redirected_output_contains_no_colour_codes() {
+    let case = Case::new();
+    case.enroll(1, "one@example.com", "one", "account-one", "user-one");
+    case.select(1);
+
+    let output = case.run(&["list"]);
+
+    assert!(output.status.success());
+    assert!(!String::from_utf8_lossy(&output.stdout).contains("\u{1b}["));
+    assert!(!String::from_utf8_lossy(&output.stderr).contains("\u{1b}["));
+}

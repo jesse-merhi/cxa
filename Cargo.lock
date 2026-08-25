@@ -224,6 +224,8 @@ dependencies = [
 name = "cxa"
 version = "0.1.0"
 dependencies = [
+ "anstream",
+ "anstyle",
  "base64",
  "chrono",
  "clap",

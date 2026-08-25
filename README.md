@@ -29,6 +29,15 @@ cd cxa
 ./install.sh
 ```
 
+Then initialize `cxa` from the Codex account that is already signed in:
+
+```sh
+cxa init
+```
+
+`cxa init` confirms the account before importing it. Use `cxa init --yes` in a
+non-interactive setup.
+
 Tagged releases contain native archives for Linux x86-64/ARM64 and macOS
 x86-64/Apple silicon, plus a `SHA256SUMS` file.
 
@@ -37,11 +46,12 @@ and systemd integration are Linux-only.
 
 ## Use
 
-Enroll an account, then select it:
+Initialize from the current Codex login, then enroll any additional accounts:
 
 ```sh
+cxa init
 cxa add
-cxa 1
+cxa 2
 ```
 
 Common commands:
@@ -55,17 +65,20 @@ cxa relogin 2
 cxa relink
 ```
 
-`cxa add` can enroll an account while Codex is running because OAuth is staged
-in an isolated home. `cxa import` copies and validates an existing Codex
-`auth.json`; it leaves the source and active credentials unchanged.
+`cxa init` imports and selects the current Codex login. If Codex is running, its
+live credentials stay detached and unchanged until it is safe to run `cxa
+relink`. `cxa add` can enroll another account while Codex is running because
+OAuth is staged in an isolated home. `cxa import` copies and validates an
+existing Codex `auth.json`; it leaves the source and active credentials
+unchanged.
 
 `cxa list` refreshes quota for every enrolled account without rotating saved
 tokens. If an inactive account's access token has expired, relogin to refresh
 its credentials.
 
-By default, account profiles live under `~/.codex-auth/profile-N` and the
-selected slot is stored in `~/.codex-auth/active-profile`. On macOS the promoted
-credential is `~/.codex-auth/auth.json`; Linux service installations use
+By default, account profiles live under `~/.codex-auth/profile-N`, the selected
+slot is stored in `~/.codex-auth/active-profile`, and the promoted credential is
+`~/.codex-auth/auth.json`. The optional Linux systemd units explicitly use
 `/var/lib/codex-auth/auth.json`. These paths can be overridden with:
 
 - `CXA_ACCOUNT_STORE`

@@ -1,5 +1,5 @@
-use std::env;
 use std::path::{Path, PathBuf};
+use std::{env, fs};
 
 use crate::{Error, Result};
 
@@ -25,10 +25,11 @@ impl Config {
         let codex_home = env_path("CXA_CODEX_HOME").unwrap_or_else(|| home.join(".codex"));
         let account_store =
             env_path("CXA_ACCOUNT_STORE").unwrap_or_else(|| home.join(".codex-auth"));
-        let active_auth =
-            env_path("CXA_ACTIVE_AUTH").unwrap_or_else(|| default_active_auth(&account_store));
+        let session_auth = codex_home.join("auth.json");
+        let active_auth = env_path("CXA_ACTIVE_AUTH")
+            .unwrap_or_else(|| default_active_auth(&account_store, &session_auth));
         let app_server_socket = env_path("CXA_SHARED_APP_SERVER_SOCKET")
-            .unwrap_or_else(|| default_app_server_socket(&account_store));
+            .unwrap_or_else(|| default_app_server_socket(&account_store, &active_auth));
         let usage_ttl_seconds = env::var("CXA_USAGE_TTL")
             .ok()
             .and_then(|value| value.parse().ok())
@@ -38,7 +39,7 @@ impl Config {
             active_profile: account_store.join("active-profile"),
             switch_lock: account_store.join("switch.lock"),
             server_start_marker: account_store.join(".shared-app-server-starting"),
-            session_auth: codex_home.join("auth.json"),
+            session_auth,
             codex_home,
             active_auth,
             account_store,
@@ -77,24 +78,18 @@ impl Config {
     }
 }
 
-#[cfg(target_os = "linux")]
-fn default_active_auth(_: &Path) -> PathBuf {
-    PathBuf::from("/var/lib/codex-auth/auth.json")
+fn default_active_auth(account_store: &Path, session_auth: &Path) -> PathBuf {
+    fs::read_link(session_auth)
+        .ok()
+        .filter(|target| target.is_absolute())
+        .unwrap_or_else(|| account_store.join("auth.json"))
 }
 
-#[cfg(not(target_os = "linux"))]
-fn default_active_auth(account_store: &Path) -> PathBuf {
-    account_store.join("auth.json")
-}
-
-#[cfg(target_os = "linux")]
-fn default_app_server_socket(_: &Path) -> PathBuf {
-    PathBuf::from("/var/lib/codex-auth/app-server.sock")
-}
-
-#[cfg(not(target_os = "linux"))]
-fn default_app_server_socket(account_store: &Path) -> PathBuf {
-    account_store.join("app-server.sock")
+fn default_app_server_socket(account_store: &Path, active_auth: &Path) -> PathBuf {
+    active_auth
+        .parent()
+        .unwrap_or(account_store)
+        .join("app-server.sock")
 }
 
 fn env_path(name: &str) -> Option<PathBuf> {
@@ -103,17 +98,37 @@ fn env_path(name: &str) -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
-#[cfg(all(test, not(target_os = "linux")))]
+#[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::symlink;
 
     #[test]
-    fn non_linux_shared_files_stay_in_the_account_store() {
+    fn shared_files_stay_in_the_account_store_by_default() {
         let store = Path::new("/users/example/.codex-auth");
-        assert_eq!(default_active_auth(store), store.join("auth.json"));
+        let session = Path::new("/users/example/.codex/auth.json");
+        let active = default_active_auth(store, session);
+        assert_eq!(active, store.join("auth.json"));
         assert_eq!(
-            default_app_server_socket(store),
+            default_app_server_socket(store, &active),
             store.join("app-server.sock")
+        );
+    }
+
+    #[test]
+    fn shared_files_follow_an_existing_absolute_session_link() {
+        let root = tempfile::tempdir().unwrap();
+        let codex_home = root.path().join(".codex");
+        let store = root.path().join(".codex-auth");
+        let service_auth = root.path().join("service/auth.json");
+        fs::create_dir_all(&codex_home).unwrap();
+        symlink(&service_auth, codex_home.join("auth.json")).unwrap();
+
+        let active = default_active_auth(&store, &codex_home.join("auth.json"));
+        assert_eq!(active, service_auth);
+        assert_eq!(
+            default_app_server_socket(&store, &active),
+            root.path().join("service/app-server.sock")
         );
     }
 }

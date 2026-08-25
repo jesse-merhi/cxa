@@ -7,6 +7,8 @@ Wants=network-online.target
 [Service]
 Type=simple
 User=%i
+Environment=CXA_ACTIVE_AUTH=/var/lib/codex-auth/auth.json
+Environment=CXA_SHARED_APP_SERVER_SOCKET=/var/lib/codex-auth/app-server.sock
 ExecStartPre=+/usr/local/libexec/codex-shared-socket recover-owner %i
 ExecStartPre=/bin/sh -c 'CXA_SKIP_USAGE_REFRESH=1 exec "$HOME/.local/bin/cxa" service-guard'
 ExecStartPre=+/usr/local/libexec/codex-shared-socket prepare %i

@@ -92,7 +92,8 @@ if [[ "$install_systemd" == "1" ]]; then
     /etc/systemd/system/codex-quota-proxy@.socket
   run sudo install -d -m 0700 -o "$login_user" -g openclaw /var/lib/codex-auth
   run sudo systemctl daemon-reload
-  printf 'Installed systemd units. Enroll an account before enabling them.\n'
+  printf 'Installed systemd units. Run cxa init before enabling them.\n'
 fi
 
 printf 'Installed cxa at %s/.local/bin/cxa\n' "$HOME"
+printf 'Next step: cxa init\n'
