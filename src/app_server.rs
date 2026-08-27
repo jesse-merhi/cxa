@@ -16,7 +16,10 @@ use tungstenite::{Message, WebSocket};
 
 use crate::account_store::{UsageRecord, UsageWindow, now_epoch};
 use crate::config::Config;
-use crate::fs::{atomic_copy, private_dir};
+use crate::fs::{
+    DeadlineUnixStream, ExclusiveLock, OWNED_TEMP_MARKER, STAGING_WRITER_LOCK, atomic_copy,
+    atomic_write, private_dir,
+};
 use crate::{Error, Result};
 
 const MAX_MESSAGE_SIZE: usize = 4 * 1024 * 1024;
@@ -29,7 +32,7 @@ pub struct QuotaResult {
 }
 
 pub fn query_shared(socket_path: &Path) -> QuotaResult {
-    match SocketClient::connect(socket_path).and_then(|mut client| query(&mut client, false)) {
+    match SocketClient::connect(socket_path).and_then(|mut client| query(&mut client, true)) {
         Ok(usage) => QuotaResult {
             usage,
             refreshed_auth: None,
@@ -47,6 +50,7 @@ pub fn prepare_offline_home(config: &Config, source_auth: &Path) -> Result<tempf
         .prefix(".quota-")
         .tempdir_in(&config.account_store)
         .map_err(|error| Error::io(&config.account_store, error))?;
+    atomic_write(&home.path().join(OWNED_TEMP_MARKER), b"cxa\n", 0o600)?;
     atomic_copy(source_auth, &home.path().join("auth.json"), 0o600)?;
     let source_config = config.codex_home.join("config.toml");
     if source_config.is_file() {
@@ -55,16 +59,16 @@ pub fn prepare_offline_home(config: &Config, source_auth: &Path) -> Result<tempf
     Ok(home)
 }
 
-pub fn query_offline(home: &Path) -> QuotaResult {
-    query_spawned(home, true)
+pub fn query_offline(config: &Config, home: &Path) -> QuotaResult {
+    query_spawned(config.codex_binary(), home, true)
 }
 
-pub fn query_offline_read_only(home: &Path) -> QuotaResult {
-    query_spawned(home, false)
+pub fn query_offline_read_only(config: &Config, home: &Path) -> QuotaResult {
+    query_spawned(config.codex_binary(), home, false)
 }
 
-fn query_spawned(home: &Path, refresh_token: bool) -> QuotaResult {
-    let mut client = match SpawnedClient::start(home) {
+fn query_spawned(codex_binary: &Path, home: &Path, refresh_token: bool) -> QuotaResult {
+    let mut client = match SpawnedClient::start(codex_binary, home) {
         Ok(client) => client,
         Err(error) => {
             return QuotaResult {
@@ -75,9 +79,7 @@ fn query_spawned(home: &Path, refresh_token: bool) -> QuotaResult {
     };
     let usage = query(&mut client, refresh_token);
     let refreshed = client.finish();
-    let refreshed_auth = refresh_token
-        .then(|| refreshed.as_ref().ok().cloned().flatten())
-        .flatten();
+    let refreshed_auth = refreshed.as_ref().ok().cloned().flatten();
     let usage = match (usage, refreshed) {
         (Ok(usage), Ok(_)) => usage,
         (Err(error), _) | (Ok(_), Err(error)) => unavailable(&error),
@@ -172,11 +174,31 @@ fn parse_usage(result: &Value) -> Result<UsageRecord> {
         .get("spendControlReached")
         .and_then(Value::as_bool)
         .unwrap_or(false);
+    let individual_window = limits
+        .get("individualLimit")
+        .and_then(Value::as_object)
+        .map(|value| {
+            let used_percent = value
+                .get("remainingPercent")
+                .and_then(Value::as_f64)
+                .map(|remaining| (100.0 - remaining).clamp(0.0, 100.0))
+                .or_else(|| {
+                    let used = value.get("used").and_then(Value::as_f64)?;
+                    let limit = value.get("limit").and_then(Value::as_f64)?;
+                    (limit > 0.0).then_some((used / limit * 100.0).clamp(0.0, 100.0))
+                })
+                .or_else(|| value.get("usedPercent").and_then(Value::as_f64));
+            UsageWindow {
+                used_percent,
+                resets_at: value.get("resetsAt").and_then(Value::as_i64),
+                window_minutes: value.get("windowDurationMins").and_then(Value::as_i64),
+            }
+        });
     Ok(UsageRecord {
         observed_at: now_epoch(),
         primary_window: window("primary"),
         secondary_window: window("secondary"),
-        individual_window: window("individualLimit"),
+        individual_window,
         reached: reached_type.is_some() || spend_control_reached,
         reached_type,
         spend_control_reached,
@@ -196,30 +218,30 @@ fn parse_usage(result: &Value) -> Result<UsageRecord> {
 }
 
 struct SocketClient {
-    websocket: WebSocket<UnixStream>,
+    websocket: WebSocket<DeadlineUnixStream>,
 }
 
 impl SocketClient {
     fn connect(path: &Path) -> Result<Self> {
         let stream = UnixStream::connect(path).map_err(|error| Error::io(path, error))?;
-        stream
-            .set_read_timeout(Some(FRAME_TIMEOUT))
-            .map_err(|error| Error::io(path, error))?;
-        stream
-            .set_write_timeout(Some(FRAME_TIMEOUT))
-            .map_err(|error| Error::io(path, error))?;
-        let mut request = "ws://localhost/rpc"
+        let stream = DeadlineUnixStream::new(stream, Instant::now() + FRAME_TIMEOUT);
+        let request = "ws://localhost/rpc"
             .into_client_request()
             .map_err(|error| Error::Protocol(error.to_string()))?;
-        request.headers_mut().insert(
-            tungstenite::http::header::SEC_WEBSOCKET_PROTOCOL,
-            tungstenite::http::HeaderValue::from_static("codex-app-server"),
-        );
         let websocket_config = WebSocketConfig::default()
             .max_message_size(Some(MAX_MESSAGE_SIZE))
             .max_frame_size(Some(MAX_MESSAGE_SIZE));
-        let (websocket, _) =
+        let (mut websocket, _) =
             client_with_config(request, stream, Some(websocket_config)).map_err(handshake_error)?;
+        websocket.get_mut().clear_deadline();
+        websocket
+            .get_mut()
+            .set_read_timeout(Some(FRAME_TIMEOUT))
+            .map_err(|error| Error::io(path, error))?;
+        websocket
+            .get_mut()
+            .set_write_timeout(Some(FRAME_TIMEOUT))
+            .map_err(|error| Error::io(path, error))?;
         Ok(Self { websocket })
     }
 }
@@ -269,15 +291,17 @@ impl RpcClient for SocketClient {
 
 struct SpawnedClient {
     child: ChildGuard,
+    _writer_lock: ExclusiveLock,
     stdin: ChildStdin,
     messages: Receiver<std::result::Result<Value, String>>,
     auth_path: PathBuf,
 }
 
 impl SpawnedClient {
-    fn start(home: &Path) -> Result<Self> {
+    fn start(codex_binary: &Path, home: &Path) -> Result<Self> {
         let auth_path = home.join("auth.json");
-        let mut command = Command::new("codex");
+        let writer_lock = ExclusiveLock::acquire_inheritable(&home.join(STAGING_WRITER_LOCK))?;
+        let mut command = Command::new(codex_binary);
         command
             .args(["-c", "cli_auth_credentials_store=\"file\"", "app-server"])
             .env("CODEX_HOME", home)
@@ -305,6 +329,7 @@ impl SpawnedClient {
         std::thread::spawn(move || read_json_lines(stdout, sender));
         Ok(Self {
             child: ChildGuard(Some(child)),
+            _writer_lock: writer_lock,
             stdin,
             messages,
             auth_path,
@@ -424,15 +449,11 @@ mod tests {
     #[allow(clippy::result_large_err)]
     fn select_codex_subprotocol(
         _: &tungstenite::handshake::server::Request,
-        mut response: tungstenite::handshake::server::Response,
+        response: tungstenite::handshake::server::Response,
     ) -> std::result::Result<
         tungstenite::handshake::server::Response,
         tungstenite::handshake::server::ErrorResponse,
     > {
-        response.headers_mut().insert(
-            tungstenite::http::header::SEC_WEBSOCKET_PROTOCOL,
-            tungstenite::http::HeaderValue::from_static("codex-app-server"),
-        );
         Ok(response)
     }
 
@@ -441,7 +462,7 @@ mod tests {
         let record = parse_usage(&json!({"rateLimits": {
             "primary": {"usedPercent": 25, "resetsAt": 4_102_444_800_i64},
             "secondary": {"usedPercent": 75, "resetsAt": 4_102_448_400_i64},
-            "individualLimit": {"usedPercent": 100, "resetsAt": 4_102_452_000_i64},
+            "individualLimit": {"remainingPercent": 25, "used": 75, "limit": 100, "resetsAt": 4_102_452_000_i64},
             "credits": {"hasCredits": false, "unlimited": false, "balance": "0"},
             "planType": "team",
             "rateLimitReachedType": "workspace_member_usage_limit_reached",
@@ -450,7 +471,7 @@ mod tests {
         .unwrap();
         assert_eq!(record.primary_window.unwrap().used_percent, Some(25.0));
         assert_eq!(record.secondary_window.unwrap().used_percent, Some(75.0));
-        assert_eq!(record.individual_window.unwrap().used_percent, Some(100.0));
+        assert_eq!(record.individual_window.unwrap().used_percent, Some(75.0));
         assert!(record.reached);
         assert!(record.spend_control_reached);
     }
@@ -479,7 +500,7 @@ mod tests {
             let account: Value =
                 serde_json::from_str(&websocket.read().unwrap().into_text().unwrap()).unwrap();
             assert_eq!(account["method"], "account/read");
-            assert_eq!(account["params"]["refreshToken"], false);
+            assert_eq!(account["params"]["refreshToken"], true);
             websocket
                 .send(Message::Text(
                     json!({"id":1,"result":{"account":{"type":"chatgpt"}}})

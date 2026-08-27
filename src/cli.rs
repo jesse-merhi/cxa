@@ -15,8 +15,11 @@ use crate::app_server::{
 };
 use crate::auth::AuthDocument;
 use crate::config::Config;
-use crate::fs::{private_dir, remove_file_if_exists};
-use crate::process::{WriterStatus, codex_writer_status, writers_running};
+use crate::fs::{
+    ExclusiveLock, OWNED_TEMP_MARKER, STAGING_WRITER_LOCK, atomic_write, private_dir,
+    remove_file_if_exists,
+};
+use crate::process::{WriterStatus, codex_writer_status, mark_service_starting, writers_running};
 use crate::terminal::{ACCENT, EMPHASIS, ERROR, MUTED, SUCCESS, WARNING};
 use crate::{Error, Result};
 
@@ -93,10 +96,11 @@ impl App {
         }
     }
 
-    fn recover_locked(&self) -> Result<()> {
-        let _lock = self.store.lock()?;
+    fn recover_locked(&self) -> Result<ExclusiveLock> {
+        let lock = self.store.lock()?;
         self.store.recover()?;
-        self.cleanup_orphaned_homes()
+        self.cleanup_orphaned_homes()?;
+        Ok(lock)
     }
 
     fn cleanup_orphaned_homes(&self) -> Result<()> {
@@ -110,6 +114,9 @@ impl App {
                 entry.map_err(|error| Error::io(&self.store.config.account_store, error))?;
             let name = entry.file_name();
             let name = name.to_string_lossy();
+            if !entry.path().join(OWNED_TEMP_MARKER).is_file() {
+                continue;
+            }
             if name.starts_with(".quota-") {
                 fs::remove_dir_all(entry.path()).map_err(|error| Error::io(entry.path(), error))?;
                 continue;
@@ -119,13 +126,9 @@ impl App {
             }
             let auth = entry.path().join("auth.json");
             if auth.is_file() {
-                let status = Command::new("codex")
-                    .arg("logout")
-                    .env("CODEX_HOME", entry.path())
-                    .stdout(Stdio::null())
-                    .stderr(Stdio::null())
-                    .status()
-                    .map_err(|error| Error::io("codex logout", error))?;
+                let status =
+                    logout_file_credentials(self.store.config.codex_binary(), &entry.path())
+                        .map_err(|error| Error::io("codex logout", error))?;
                 if !status.success() {
                     return Err(Error::Message(format!(
                         "Codex logout still failed; rejected credentials remain at {} for retry.",
@@ -139,8 +142,7 @@ impl App {
     }
 
     fn init(&self, assume_yes: bool) -> Result<()> {
-        self.recover_locked()?;
-        let _lock = self.store.lock()?;
+        let _lock = self.recover_locked()?;
         self.store.adopt_detached_session_selection()?;
 
         let profiles = self.store.profiles()?;
@@ -149,8 +151,11 @@ impl App {
                 let profile = self.store.resolve(&selected.to_string())?;
                 println!(
                     "{SUCCESS}✓{SUCCESS:#} cxa is already initialized with account {ACCENT}{selected}{ACCENT:#} ({EMPHASIS}{}{EMPHASIS:#}).",
-                    profile.auth.identity.email
+                    profile.auth.identity.label()
                 );
+                if !self.store.config.session_links_to_active() {
+                    print_relink_warning();
+                }
                 return Ok(());
             }
             return Err(Error::Message(
@@ -167,15 +172,15 @@ impl App {
         }
         let current = AuthDocument::read(session_path)?;
         if !assume_yes {
-            if !io::stdin().is_terminal() {
+            if !confirmation_is_interactive(io::stdin().is_terminal(), io::stdout().is_terminal()) {
                 return Err(Error::Message(format!(
-                    "Found the current Codex login: {}. Run `cxa init --yes` to import it non-interactively.",
-                    current.identity.email
+                    "Found the current Codex login: {}. Run `cxa init --yes` when input or output is redirected.",
+                    current.identity.label()
                 )));
             }
             print!(
                 "{ACCENT}?{ACCENT:#} Found the current Codex login: {EMPHASIS}{}{EMPHASIS:#}\n  Import it as account {ACCENT}1{ACCENT:#}? {MUTED}[Y/n]{MUTED:#} ",
-                current.identity.email
+                current.identity.label()
             );
             io::stdout()
                 .flush()
@@ -199,8 +204,8 @@ impl App {
         }
 
         let slot = self.store.next_slot()?;
-        let barrier = self.store.begin_enrollment(session_path.to_owned())?;
-        barrier.commit_profile(slot, session_path, true, true, false)?;
+        let barrier = self.store.begin_profile_commit()?;
+        barrier.commit_profile(slot, session_path, &current, false, true, false)?;
 
         let linked = if writers_running(&self.store.config) {
             false
@@ -211,7 +216,7 @@ impl App {
                 .and_then(|barrier| barrier.commit_switch(slot, true))
             {
                 Ok(()) => true,
-                Err(Error::WriterRunning) => false,
+                Err(Error::WriterRunning | Error::RecoveryDeferred) => false,
                 Err(error) => return Err(error),
             }
         };
@@ -219,20 +224,20 @@ impl App {
         self.refresh_usage(slot)?;
         println!(
             "{SUCCESS}✓{SUCCESS:#} Imported {EMPHASIS}{}{EMPHASIS:#} as account {ACCENT}{slot}{ACCENT:#}.",
-            current.identity.email
+            current.identity.label()
         );
         println!("{SUCCESS}✓{SUCCESS:#} Account {ACCENT}{slot}{ACCENT:#} is now selected.");
-        let usage = self
-            .store
-            .usage(slot)
-            .map(|usage| usage.label(now_epoch()))
+        propagate_codex_home(&self.store.config);
+        let now = now_epoch();
+        let usage_record = self.store.usage(slot);
+        let usage = usage_record
+            .as_ref()
+            .map(|usage| usage.label(now))
             .unwrap_or_else(|| "usage unknown".into());
-        let usage_style = usage_style(&usage);
+        let usage_style = usage_style(usage_record.as_ref(), now);
         println!("{ACCENT}Quota{ACCENT:#}: {usage_style}{usage}{usage_style:#}");
         if !linked {
-            println!(
-                "{WARNING}!{WARNING:#} Codex is running, so its live credentials were left untouched; run {ACCENT}cxa relink{ACCENT:#} after Codex stops to enable switching."
-            );
+            print_relink_warning();
         }
         println!("{MUTED}Next:{MUTED:#} add another account with {ACCENT}cxa add{ACCENT:#}");
         Ok(())
@@ -242,19 +247,16 @@ impl App {
         match AuthDocument::read(&self.store.config.session_auth) {
             Ok(current) => format!(
                 "Found the current Codex login: {}\ncxa is not initialized. Run: cxa init",
-                current.identity.email
+                current.identity.label()
             ),
             Err(_) => "cxa is not initialized. Run `codex login`, then run `cxa init`.".into(),
         }
     }
 
     fn list(&self) -> Result<()> {
-        self.recover_locked()?;
-        let _lock = self.store.lock()?;
+        let _lock = self.recover_locked()?;
         self.store.adopt_detached_session_selection()?;
-        if !writers_running(&self.store.config) {
-            self.store.sync_active_to_profile()?;
-        }
+        self.store.reconcile_if_idle()?;
         let profiles = self.store.profiles()?;
         if profiles.is_empty() {
             println!("{}", self.initialization_guidance());
@@ -266,9 +268,10 @@ impl App {
         let selected = self.store.selected();
         let width = profiles
             .iter()
-            .map(|profile| profile.auth.identity.email.len())
+            .map(|profile| profile.auth.identity.label().len())
             .max()
             .unwrap_or_default();
+        let now = now_epoch();
         for profile in &profiles {
             let selected_style = if Some(profile.slot) == selected {
                 SUCCESS
@@ -280,15 +283,16 @@ impl App {
             } else {
                 ' '
             };
-            let usage = self
-                .store
-                .usage(profile.slot)
-                .map(|usage| usage.label(now_epoch()))
+            let usage_record = self.store.usage(profile.slot);
+            let usage = usage_record
+                .as_ref()
+                .map(|usage| usage.label(now))
                 .unwrap_or_else(|| "usage unknown".into());
-            let usage_style = usage_style(&usage);
+            let usage_style = usage_style(usage_record.as_ref(), now);
             println!(
                 "{selected_style}{marker}{selected_style:#} {ACCENT}{}{ACCENT:#}  {EMPHASIS}{:width$}{EMPHASIS:#}  {usage_style}{usage}{usage_style:#}",
-                profile.slot, profile.auth.identity.email
+                profile.slot,
+                profile.auth.identity.label()
             );
         }
         if profiles.len() > 1 {
@@ -300,25 +304,33 @@ impl App {
     }
 
     fn status(&self, refresh: bool) -> Result<()> {
-        self.recover_locked()?;
-        let _lock = self.store.lock()?;
+        let _lock = self.recover_locked()?;
         self.store.adopt_detached_session_selection()?;
         if self.store.profiles()?.is_empty() {
             return Err(Error::Message(self.initialization_guidance()));
         }
-        if !writers_running(&self.store.config) {
-            self.store.sync_active_to_profile()?;
-        }
+        self.store.reconcile_if_idle()?;
         if refresh {
             if let Some(slot) = self.store.selected() {
                 self.refresh_usage(slot)?;
             }
         }
-        for line in self.store.status_lines()? {
-            print_status_line(&line);
-        }
+        self.print_status_lines()?;
         if let Some(issue) = self.store.status_issue()? {
             return Err(Error::Message(issue));
+        }
+        Ok(())
+    }
+
+    fn print_status_lines(&self) -> Result<()> {
+        let now = now_epoch();
+        let usage = self
+            .store
+            .selected()
+            .and_then(|slot| self.store.usage(slot));
+        let quota_style = usage_style(usage.as_ref(), now);
+        for line in self.store.status_lines()? {
+            print_status_line(&line, quota_style);
         }
         Ok(())
     }
@@ -330,17 +342,14 @@ impl App {
         }
         let previous = self.store.usage(slot);
         if writers_running(config) {
-            if config.app_server_socket.exists()
-                && AuthDocument::read(&config.active_auth)
-                    .ok()
-                    .and_then(|active| {
-                        self.store
-                            .slot_for_identity(&active.identity)
-                            .ok()
-                            .flatten()
-                    })
-                    == Some(slot)
-            {
+            let session_slot = AuthDocument::read(&config.session_auth)
+                .ok()
+                .and_then(|auth| self.store.slot_for_identity(&auth.identity).ok().flatten());
+            let active_slot = AuthDocument::read(&config.active_auth)
+                .ok()
+                .and_then(|auth| self.store.slot_for_identity(&auth.identity).ok().flatten());
+            let live_slot = session_slot.or(active_slot).or(self.store.selected());
+            if config.app_server_socket.exists() && active_slot == Some(slot) {
                 touch_private(&config.usage_attempt(slot))?;
                 let result = query_shared(&config.app_server_socket);
                 write_usage_result(
@@ -348,6 +357,9 @@ impl App {
                     &result.usage,
                     &config.profile_usage(slot),
                 )?;
+                return Ok(());
+            }
+            if live_slot == Some(slot) {
                 return Ok(());
             }
             return self.refresh_usage_read_only(slot, previous.as_ref());
@@ -363,7 +375,7 @@ impl App {
         let auth_path = home.path().join("auth.json");
         let mut barrier = self.store.begin_barrier()?;
         barrier.mark_refreshing(Some(slot), auth_path, true, false, false)?;
-        let result = query_offline(home.path());
+        let result = query_offline(config, home.path());
         let Some(_) = result.refreshed_auth else {
             barrier.rollback()?;
             write_usage_result(
@@ -380,7 +392,7 @@ impl App {
                 return Err(error);
             }
         };
-        if refreshed.identity != original.identity {
+        if !refreshed.identity.same_account(&original.identity) {
             barrier.rollback()?;
             return Err(Error::Message(
                 "app server refreshed credentials for a different account".into(),
@@ -395,8 +407,14 @@ impl App {
             )?;
             return Ok(());
         }
-        let commit =
-            barrier.commit_profile(slot, &home.path().join("auth.json"), true, false, false);
+        let commit = barrier.commit_profile(
+            slot,
+            &home.path().join("auth.json"),
+            &refreshed,
+            true,
+            false,
+            false,
+        );
         match commit {
             Ok(()) => write_usage_result(
                 previous.as_ref(),
@@ -417,8 +435,7 @@ impl App {
     }
 
     fn switch(&self, selector: &str) -> Result<()> {
-        self.recover_locked()?;
-        let _lock = self.store.lock()?;
+        let _lock = self.recover_locked()?;
         refuse_writers(&self.store.config)?;
         let target = self.store.resolve(selector)?;
         if self
@@ -429,18 +446,14 @@ impl App {
             eprintln!(
                 "{WARNING}warning{WARNING:#}: account {ACCENT}{}{ACCENT:#} ({EMPHASIS}{}{EMPHASIS:#}) was last seen exhausted -- {ERROR}{}{ERROR:#}",
                 target.slot,
-                target.auth.identity.email,
+                target.auth.identity.label(),
                 self.store.usage(target.slot).unwrap().label(now_epoch())
             );
         }
-        self.store.ensure_session_link()?;
-        self.store.sync_or_restore_selected()?;
         let barrier = self.store.begin_barrier()?;
         barrier.commit_switch(target.slot, true)?;
         propagate_codex_home(&self.store.config);
-        for line in self.store.status_lines()? {
-            print_status_line(&line);
-        }
+        self.print_status_lines()?;
         println!(
             "{SUCCESS}✓{SUCCESS:#} New Codex launches will use this account; session history remains shared."
         );
@@ -451,15 +464,45 @@ impl App {
         let config = &self.store.config;
         touch_private(&config.usage_attempt(slot))?;
         let source = config.profile_auth(slot);
+        let original = AuthDocument::read(&source)?;
         let home = prepare_offline_home(config, &source)?;
-        let result = query_offline_read_only(home.path());
+        let auth_path = home.path().join("auth.json");
+        let mut barrier = self.store.begin_profile_commit()?;
+        barrier.mark_refreshing(Some(slot), auth_path.clone(), false, false, false)?;
+        let result = query_offline_read_only(config, home.path());
+        if result.refreshed_auth.is_some() {
+            let refreshed = match AuthDocument::read(&auth_path) {
+                Ok(refreshed) => refreshed,
+                Err(error) => {
+                    let _ = home.keep();
+                    return Err(error);
+                }
+            };
+            if !refreshed.identity.same_account(&original.identity) {
+                let _ = home.keep();
+                return Err(Error::Message(
+                    "app server refreshed credentials for a different account".into(),
+                ));
+            }
+            if !refreshed.same_credentials(&original) {
+                if let Err(error) =
+                    barrier.commit_profile(slot, &auth_path, &refreshed, false, false, false)
+                {
+                    let _ = home.keep();
+                    return Err(error);
+                }
+            } else {
+                barrier.rollback()?;
+            }
+        } else {
+            barrier.rollback()?;
+        }
         write_usage_result(previous, &result.usage, &config.profile_usage(slot))
     }
 
     fn add(&self, options: &[OsString]) -> Result<()> {
         reject_non_oauth(options)?;
-        self.recover_locked()?;
-        let _lock = self.store.lock()?;
+        let _lock = self.recover_locked()?;
         let mut login = StagedLogin::prepare(&self.store.config)?;
         let barrier = self.store.begin_enrollment(login.auth_path().to_owned())?;
         if let Err(error) = login.execute(options) {
@@ -483,39 +526,40 @@ impl App {
             revoke?;
             return Err(Error::Message(format!(
                 "{} is already enrolled as account {slot}; nothing was added.",
-                fresh.identity.email
+                fresh.identity.label()
             )));
         }
         let slot = self.store.next_slot()?;
-        if let Err(error) = barrier.commit_profile(slot, login.auth_path(), false, false, false) {
+        if let Err(error) =
+            barrier.commit_profile(slot, login.auth_path(), &fresh, false, false, false)
+        {
             login.preserve();
             return Err(error);
         }
         login.accept();
         println!(
             "\n{SUCCESS}✓{SUCCESS:#} Enrolled {EMPHASIS}{}{EMPHASIS:#} as account {ACCENT}{slot}{ACCENT:#}.",
-            fresh.identity.email
+            fresh.identity.label()
         );
         println!("{MUTED}Next:{MUTED:#} switch to it with {ACCENT}cxa {slot}{ACCENT:#}");
         Ok(())
     }
 
     fn import(&self, auth_file: &Path) -> Result<()> {
-        self.recover_locked()?;
-        let _lock = self.store.lock()?;
+        let _lock = self.recover_locked()?;
         let imported = AuthDocument::read(auth_file)?;
         if let Some(slot) = self.store.slot_for_identity(&imported.identity)? {
             return Err(Error::Message(format!(
                 "{} is already enrolled as account {slot}; nothing was imported.",
-                imported.identity.email
+                imported.identity.label()
             )));
         }
         let slot = self.store.next_slot()?;
-        let barrier = self.store.begin_enrollment(auth_file.to_owned())?;
-        barrier.commit_profile(slot, auth_file, false, false, false)?;
+        let barrier = self.store.begin_profile_commit()?;
+        barrier.commit_profile(slot, auth_file, &imported, false, false, false)?;
         println!(
             "{SUCCESS}✓{SUCCESS:#} Imported {EMPHASIS}{}{EMPHASIS:#} as account {ACCENT}{slot}{ACCENT:#}.",
-            imported.identity.email
+            imported.identity.label()
         );
         println!("{MUTED}Next:{MUTED:#} switch to it with {ACCENT}cxa {slot}{ACCENT:#}");
         Ok(())
@@ -523,18 +567,17 @@ impl App {
 
     fn relogin(&self, selector: &str, options: &[OsString]) -> Result<()> {
         reject_non_oauth(options)?;
-        self.recover_locked()?;
-        let _lock = self.store.lock()?;
+        let _lock = self.recover_locked()?;
         refuse_writers(&self.store.config)?;
-        self.store.sync_or_restore_selected()?;
         let target = self.store.resolve(selector)?;
-        let selected = self.store.selected();
         println!(
             "{ACCENT}Re-authenticating account {}{ACCENT:#} ({EMPHASIS}{}{EMPHASIS:#}). {MUTED}The shared session stays on the current account.{MUTED:#}\n",
-            target.slot, target.auth.identity.email
+            target.slot,
+            target.auth.identity.label()
         );
         let mut login = StagedLogin::prepare(&self.store.config)?;
         let mut barrier = self.store.begin_barrier()?;
+        let selected = self.store.selected();
         let first_selection = selected.is_none();
         let activate = selected == Some(target.slot) || first_selection;
         barrier.mark_refreshing(
@@ -559,18 +602,20 @@ impl App {
                 return Err(error);
             }
         };
-        if fresh.identity != target.auth.identity {
+        if !fresh.identity.same_account(&target.auth.identity) {
             let revoke = login.revoke();
             barrier.rollback()?;
             revoke?;
             return Err(Error::Message(format!(
                 "Signed in to the wrong workspace for account {} ({}). Nothing was changed.",
-                target.slot, target.auth.identity.email
+                target.slot,
+                target.auth.identity.label()
             )));
         }
         match barrier.commit_profile(
             target.slot,
             login.auth_path(),
+            &fresh,
             activate,
             first_selection,
             true,
@@ -592,6 +637,7 @@ impl App {
         remove_file_if_exists(&self.store.config.profile_usage(target.slot))?;
         remove_file_if_exists(&self.store.config.usage_attempt(target.slot))?;
         if activate {
+            propagate_codex_home(&self.store.config);
             println!(
                 "{SUCCESS}✓{SUCCESS:#} Account {ACCENT}{}{ACCENT:#} is selected, so the shared active credentials were updated too.",
                 target.slot
@@ -599,43 +645,37 @@ impl App {
         }
         println!(
             "\n{SUCCESS}✓{SUCCESS:#} Re-authenticated {EMPHASIS}{}{EMPHASIS:#} as account {ACCENT}{}{ACCENT:#}.",
-            fresh.identity.email, target.slot
+            fresh.identity.label(),
+            target.slot
         );
         Ok(())
     }
 
     fn relink(&self) -> Result<()> {
-        self.recover_locked()?;
-        let _lock = self.store.lock()?;
+        let _lock = self.recover_locked()?;
         refuse_writers(&self.store.config)?;
-        self.store.ensure_session_link()?;
-        self.store.sync_or_restore_selected()?;
+        let barrier = self.store.begin_barrier()?;
         let selected = self
             .store
             .selected()
             .ok_or_else(|| Error::Message("No default Codex account is selected.".into()))?;
-        let barrier = self.store.begin_barrier()?;
         barrier.commit_switch(selected, true)?;
-        for line in self.store.status_lines()? {
-            print_status_line(&line);
-        }
+        propagate_codex_home(&self.store.config);
+        self.print_status_lines()?;
         Ok(())
     }
 
     fn service_guard(&self) -> Result<()> {
         let _lock = self.store.lock()?;
-        if codex_writer_status() == WriterStatus::Running {
+        if codex_writer_status(&self.store.config) != WriterStatus::Stopped {
             return Err(Error::Message(
                 "Another Codex process is already running; refusing a second refresh owner.".into(),
             ));
         }
         remove_file_if_exists(&self.store.config.server_start_marker)?;
         self.store.recover()?;
-        if fs::read_link(&self.store.config.session_auth)
-            .ok()
-            .as_deref()
-            != Some(&self.store.config.active_auth)
-        {
+        self.cleanup_orphaned_homes()?;
+        if !self.store.config.session_links_to_active() {
             return Err(Error::Message(
                 "Session credentials are detached from the shared active file. Stop Codex processes and run: cxa relink"
                     .into(),
@@ -652,7 +692,7 @@ impl App {
                     .into(),
             ));
         }
-        touch_private(&self.store.config.server_start_marker)
+        mark_service_starting(&self.store.config)
     }
 
     fn service_release(&self) -> Result<()> {
@@ -661,29 +701,42 @@ impl App {
     }
 }
 
-fn usage_style(label: &str) -> Style {
-    if label.contains("EXHAUSTED") || label.contains("100% used") {
+fn print_relink_warning() {
+    println!(
+        "{WARNING}!{WARNING:#} Codex session credentials are detached; run {ACCENT}cxa relink{ACCENT:#} after Codex stops to enable switching."
+    );
+}
+
+fn confirmation_is_interactive(stdin: bool, stdout: bool) -> bool {
+    stdin && stdout
+}
+
+fn usage_style(usage: Option<&UsageRecord>, now: i64) -> Style {
+    let Some(usage) = usage else {
+        return WARNING;
+    };
+    let max_used = usage.max_current_used_percent(now);
+    if usage.exhausted_now(now) || max_used.is_some_and(|percent| percent >= 100.0) {
         return ERROR;
     }
-    let primary_percent = label
-        .split_whitespace()
-        .find_map(|word| word.strip_suffix('%'))
-        .and_then(|percent| percent.parse::<u8>().ok());
-    if label.contains("unknown") || primary_percent.is_some_and(|percent| percent >= 80) {
+    if !usage.succeeded()
+        || usage.credits_depleted()
+        || max_used.is_some_and(|percent| percent >= 80.0)
+    {
         WARNING
     } else {
         SUCCESS
     }
 }
 
-fn print_status_line(line: &str) {
+fn print_status_line(line: &str, quota_style: Style) {
     let Some((label, value)) = line.split_once(": ") else {
         println!("{line}");
         return;
     };
     let value_style = match label {
         "Default Codex account" => EMPHASIS,
-        "Quota" => usage_style(value),
+        "Quota" => quota_style,
         "Session credentials"
             if value.contains("DETACHED")
                 || value.contains("MISSING")
@@ -737,13 +790,14 @@ fn refuse_writers(config: &Config) -> Result<()> {
 
 fn reject_non_oauth(options: &[OsString]) -> Result<()> {
     for option in options {
-        if matches!(
-            option.to_str(),
-            Some("--with-api-key" | "--with-access-token")
-        ) {
+        let Some(option) = option.to_str() else {
+            continue;
+        };
+        let name = option.split_once('=').map_or(option, |(name, _)| name);
+        if matches!(name, "--with-api-key" | "--with-access-token") {
             return Err(Error::Message(format!(
                 "cxa requires ChatGPT OAuth credentials; {} is not supported.",
-                option.to_string_lossy()
+                name
             )));
         }
     }
@@ -752,7 +806,9 @@ fn reject_non_oauth(options: &[OsString]) -> Result<()> {
 
 struct StagedLogin {
     home: Option<tempfile::TempDir>,
+    _writer_lock: ExclusiveLock,
     auth_path: PathBuf,
+    codex_binary: PathBuf,
     accepted: bool,
 }
 
@@ -762,6 +818,9 @@ impl StagedLogin {
             .prefix(".enroll-")
             .tempdir_in(&config.account_store)
             .map_err(|error| Error::io(&config.account_store, error))?;
+        atomic_write(&home.path().join(OWNED_TEMP_MARKER), b"cxa\n", 0o600)?;
+        let writer_lock =
+            ExclusiveLock::acquire_inheritable(&home.path().join(STAGING_WRITER_LOCK))?;
         let source_config = config.codex_home.join("config.toml");
         if source_config.is_file() {
             fs::copy(&source_config, home.path().join("config.toml"))
@@ -770,7 +829,9 @@ impl StagedLogin {
         let auth_path = home.path().join("auth.json");
         Ok(Self {
             home: Some(home),
+            _writer_lock: writer_lock,
             auth_path,
+            codex_binary: config.codex_binary().to_owned(),
             accepted: false,
         })
     }
@@ -780,7 +841,7 @@ impl StagedLogin {
             .home
             .as_ref()
             .ok_or_else(|| Error::Message("staged login is no longer available".into()))?;
-        let status = Command::new("codex")
+        let status = Command::new(&self.codex_binary)
             .arg("login")
             .args(options)
             .args(["-c", "cli_auth_credentials_store=\"file\""])
@@ -817,12 +878,7 @@ impl StagedLogin {
         if !self.auth_path.exists() {
             return Ok(());
         }
-        let status = Command::new("codex")
-            .arg("logout")
-            .env("CODEX_HOME", home.path())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
+        let status = logout_file_credentials(&self.codex_binary, home.path());
         match status {
             Ok(status) if status.success() => Ok(()),
             Ok(_) => {
@@ -851,12 +907,7 @@ impl Drop for StagedLogin {
         if self.accepted || !self.auth_path.exists() {
             return;
         }
-        let revoked = Command::new("codex")
-            .arg("logout")
-            .env("CODEX_HOME", home.path())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
+        let revoked = logout_file_credentials(&self.codex_binary, home.path())
             .is_ok_and(|status| status.success());
         if !revoked {
             let _ = home.keep();
@@ -882,4 +933,130 @@ fn propagate_codex_home(config: &Config) {
     }
 }
 
+fn logout_file_credentials(
+    codex_binary: &Path,
+    home: &Path,
+) -> std::io::Result<std::process::ExitStatus> {
+    Command::new(codex_binary)
+        .arg("logout")
+        .args(["-c", "cli_auth_credentials_store=\"file\""])
+        .env("CODEX_HOME", home)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+}
+
 use std::os::unix::fs::OpenOptionsExt;
+
+#[cfg(test)]
+mod tests {
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    use super::{App, confirmation_is_interactive, usage_style};
+    use crate::account_store::{Store, UsageRecord, UsageWindow};
+    use crate::config::Config;
+    use crate::terminal::{ERROR, SUCCESS, WARNING};
+
+    #[test]
+    fn confirmation_requires_visible_interactive_input_and_output() {
+        assert!(confirmation_is_interactive(true, true));
+        assert!(!confirmation_is_interactive(false, true));
+        assert!(!confirmation_is_interactive(true, false));
+    }
+
+    #[test]
+    fn quota_style_uses_fractional_usage_from_every_window() {
+        let usage = UsageRecord {
+            primary_window: Some(UsageWindow {
+                used_percent: Some(10.0),
+                ..UsageWindow::default()
+            }),
+            secondary_window: Some(UsageWindow {
+                used_percent: Some(99.5),
+                ..UsageWindow::default()
+            }),
+            ..UsageRecord::default()
+        };
+        assert_eq!(usage_style(Some(&usage), 10_000), WARNING);
+
+        let exhausted = UsageRecord {
+            individual_window: Some(UsageWindow {
+                used_percent: Some(100.0),
+                ..UsageWindow::default()
+            }),
+            ..UsageRecord::default()
+        };
+        assert_eq!(usage_style(Some(&exhausted), 10_000), ERROR);
+
+        let healthy = UsageRecord {
+            primary_window: Some(UsageWindow {
+                used_percent: Some(25.5),
+                ..UsageWindow::default()
+            }),
+            ..UsageRecord::default()
+        };
+        assert_eq!(usage_style(Some(&healthy), 10_000), SUCCESS);
+
+        let expired = UsageRecord {
+            primary_window: Some(UsageWindow {
+                used_percent: Some(100.0),
+                resets_at: Some(9_999),
+                ..UsageWindow::default()
+            }),
+            reached: true,
+            ..UsageRecord::default()
+        };
+        assert_eq!(usage_style(Some(&expired), 10_000), SUCCESS);
+        assert!(!expired.label(10_000).contains("EXHAUSTED"));
+
+        let depleted = UsageRecord {
+            has_credits: Some(false),
+            unlimited: Some(false),
+            balance: Some(serde_json::json!("25")),
+            ..UsageRecord::default()
+        };
+        assert_eq!(usage_style(Some(&depleted), 10_000), WARNING);
+        assert!(depleted.label(10_000).contains("no credits"));
+        assert_eq!(usage_style(None, 10_000), WARNING);
+    }
+
+    #[test]
+    fn recovery_returns_the_lock_held_for_the_calling_command() {
+        let root = tempfile::tempdir().unwrap();
+        let account_store = root.path().join("store");
+        let config = Config {
+            codex_home: root.path().join("codex"),
+            codex_binary: None,
+            active_auth: account_store.join("auth.json"),
+            account_store: account_store.clone(),
+            active_profile: account_store.join("active-profile"),
+            switch_lock: account_store.join("switch.lock"),
+            server_start_marker: account_store.join("starting"),
+            app_server_socket: account_store.join("app-server.sock"),
+            session_auth: root.path().join("codex/auth.json"),
+            usage_ttl_seconds: 120,
+            skip_usage_refresh: true,
+        };
+        let app = App::new(config.clone());
+
+        let recovery_lock = app.recover_locked().unwrap();
+        let (started_tx, started_rx) = mpsc::channel();
+        let (acquired_tx, acquired_rx) = mpsc::channel();
+        let contender = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            let _lock = Store::new(config).lock().unwrap();
+            acquired_tx.send(()).unwrap();
+        });
+
+        started_rx.recv().unwrap();
+        assert!(
+            acquired_rx
+                .recv_timeout(Duration::from_millis(100))
+                .is_err()
+        );
+        drop(recovery_lock);
+        acquired_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        contender.join().unwrap();
+    }
+}

@@ -1,6 +1,6 @@
 [Unit]
 Description=Quota-only Codex app-server bridge for OpenClaw
-Requires=codex-shared-app-server@%i.service
+BindsTo=codex-shared-app-server@%i.service
 After=codex-shared-app-server@%i.service
 
 [Service]

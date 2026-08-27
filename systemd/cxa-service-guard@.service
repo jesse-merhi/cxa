@@ -1,0 +1,14 @@
+[Unit]
+Description=Recover and validate shared Codex credentials for %i
+Documentation=https://github.com/jesse-merhi/cxa
+Before=codex-shared-app-server@%i.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=no
+User=%i
+EnvironmentFile=/etc/cxa/%i.env
+Environment=CXA_ACTIVE_AUTH=/var/lib/codex-auth/auth.json
+Environment=CXA_SHARED_APP_SERVER_SOCKET=/var/lib/codex-auth/app-server.sock
+ExecStart=+/usr/local/libexec/codex-shared-socket recover-owner %i
+ExecStart=/bin/sh -c 'CXA_SKIP_USAGE_REFRESH=1 exec "$CXA_CLI_BIN" service-guard'

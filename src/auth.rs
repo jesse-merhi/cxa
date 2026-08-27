@@ -10,9 +10,22 @@ use crate::{Error, Result};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Identity {
-    pub email: String,
-    pub account_id: String,
+    pub email: Option<String>,
+    pub account_id: Option<String>,
     pub user_id: String,
+}
+
+impl Identity {
+    pub fn same_account(&self, other: &Self) -> bool {
+        self.account_id == other.account_id && self.user_id == other.user_id
+    }
+
+    pub fn label(&self) -> &str {
+        self.email
+            .as_deref()
+            .or(self.account_id.as_deref())
+            .unwrap_or(&self.user_id)
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -37,6 +50,15 @@ impl AuthDocument {
             .get("id_token")
             .and_then(Value::as_str)
             .ok_or_else(|| Error::InvalidAuth(path.to_owned()))?;
+        for field in ["access_token", "refresh_token"] {
+            if tokens
+                .get(field)
+                .and_then(Value::as_str)
+                .is_none_or(|value| value.is_empty())
+            {
+                return Err(Error::InvalidAuth(path.to_owned()));
+            }
+        }
         let claims = decode_claims(id_token).ok_or_else(|| Error::InvalidAuth(path.to_owned()))?;
         let profile = claims
             .get("https://api.openai.com/profile")
@@ -71,8 +93,8 @@ impl AuthDocument {
             path: path.to_owned(),
             raw,
             identity: Identity {
-                email: email.ok_or_else(|| Error::InvalidAuth(path.to_owned()))?,
-                account_id: account_id.ok_or_else(|| Error::InvalidAuth(path.to_owned()))?,
+                email,
+                account_id,
                 user_id: user_id.ok_or_else(|| Error::InvalidAuth(path.to_owned()))?,
             },
             refresh_ns,
@@ -99,7 +121,7 @@ mod tests {
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 
     #[test]
-    fn decodes_namespaced_profile_email_and_identity() {
+    fn reads_namespaced_profile_email_and_identity() {
         let claims = serde_json::json!({
             "https://api.openai.com/profile": {"email": "one@example.com"},
             "https://api.openai.com/auth": {"chatgpt_user_id": "user-one"}
@@ -108,10 +130,58 @@ mod tests {
             "header.{}.signature",
             URL_SAFE_NO_PAD.encode(serde_json::to_vec(&claims).unwrap())
         );
-        let claims = decode_claims(&token).unwrap();
-        assert_eq!(
-            claims["https://api.openai.com/profile"]["email"],
-            "one@example.com"
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("auth.json");
+        fs::write(
+            &path,
+            serde_json::to_vec(&serde_json::json!({
+                "tokens": {
+                    "id_token": token,
+                    "access_token": "access",
+                    "refresh_token": "refresh",
+                    "account_id": "account-one"
+                },
+                "last_refresh": "2026-01-01T00:00:00Z"
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let auth = AuthDocument::read(&path).unwrap();
+        assert_eq!(auth.identity.email.as_deref(), Some("one@example.com"));
+        assert_eq!(auth.identity.account_id.as_deref(), Some("account-one"));
+        assert_eq!(auth.identity.user_id, "user-one");
+    }
+
+    #[test]
+    fn accepts_stable_personal_identity_without_email_or_workspace_claims() {
+        let claims = serde_json::json!({
+            "https://api.openai.com/auth": {"chatgpt_user_id": "user-one"}
+        });
+        let token = format!(
+            "header.{}.signature",
+            URL_SAFE_NO_PAD.encode(serde_json::to_vec(&claims).unwrap())
         );
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("auth.json");
+        fs::write(
+            &path,
+            serde_json::to_vec(&serde_json::json!({
+                "tokens": {
+                    "id_token": token,
+                    "access_token": "access",
+                    "refresh_token": "refresh"
+                },
+                "last_refresh": "2026-01-01T00:00:00Z"
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let auth = AuthDocument::read(&path).unwrap();
+        assert_eq!(auth.identity.email, None);
+        assert_eq!(auth.identity.account_id, None);
+        assert_eq!(auth.identity.user_id, "user-one");
+        assert_eq!(auth.identity.label(), "user-one");
     }
 }

@@ -23,10 +23,14 @@ printf '%s\n' "${checksums[@]}" >"$test_dir/SHA256SUMS"
   "$test_dir/SHA256SUMS" \
   "$test_dir/cxa.rb"
 
-grep -Fq 'version "1.2.3"' "$test_dir/cxa.rb"
 grep -Fq '/releases/download/v1.2.3/cxa-macos-aarch64.tar.gz' "$test_dir/cxa.rb"
 grep -Fq "$(printf '1%.0s' {1..64})" "$test_dir/cxa.rb"
 grep -Fq "$(printf '4%.0s' {1..64})" "$test_dir/cxa.rb"
+
+if grep -Fq '  version "' "$test_dir/cxa.rb"; then
+  echo "error: generated formula contains a redundant explicit version" >&2
+  exit 1
+fi
 
 if grep -Fq '@' "$test_dir/cxa.rb"; then
   echo "error: generated formula still contains a template placeholder" >&2

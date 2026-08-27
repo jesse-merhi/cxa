@@ -7,15 +7,15 @@ changes while another Codex process may be refreshing tokens.
 
 The repository also includes an optional Linux service setup:
 
-- `codex-shared-app-server` is the sole owner allowed to refresh the active
-  credential.
+- `codex-shared-app-server` serves quota reads through a read-only view of the
+  active credential, so it cannot compete with ordinary Codex token refreshes.
 - `codex-quota-proxy` exposes only account and rate-limit methods to another
   local service account.
 - `codex-shared-socket` safely prepares and publishes the private Unix socket.
 
 ## Install
 
-Install with Homebrew:
+After the first stable release is published, install with Homebrew:
 
 ```sh
 brew install jesse-merhi/tap/cxa
@@ -45,7 +45,10 @@ cxa init
 non-interactive setup.
 
 Tagged releases contain native archives for Linux x86-64/ARM64 and macOS
-x86-64/Apple silicon, plus a `SHA256SUMS` file.
+x86-64/Apple silicon, plus a `SHA256SUMS` file. Extract the archive for your
+platform and run `./install.sh` to install the bundled binary without Rust.
+Linux archives target glibc 2.35 (Ubuntu 22.04 or newer) and are smoke-tested
+on both supported architectures. Windows is not currently supported.
 
 The CLI builds on macOS, but the shared app-server, privileged socket helper,
 and systemd integration are Linux-only.
@@ -78,21 +81,31 @@ OAuth is staged in an isolated home. `cxa import` copies and validates an
 existing Codex `auth.json`; it leaves the source and active credentials
 unchanged.
 
-`cxa list` refreshes quota for every enrolled account without rotating saved
-tokens. If an inactive account's access token has expired, relogin to refresh
-its credentials.
+`cxa list` refreshes inactive accounts without switching. While Codex is
+running, the live account uses the shared app server when available and
+otherwise keeps its cached quota so only one process can own token refresh. The
+shared app server reloads externally rotated credentials before reading quota,
+but its refresh endpoint is disabled so ordinary Codex remains the only OAuth
+refresh owner. If Codex rotates OAuth credentials while cxa reads an inactive
+account's quota, cxa safely saves the new credentials to that profile. If an
+inactive account's access token has expired, relogin to refresh its credentials.
 
 By default, account profiles live under `~/.codex-auth/profile-N`, the selected
 slot is stored in `~/.codex-auth/active-profile`, and the promoted credential is
 `~/.codex-auth/auth.json`. The optional Linux systemd units explicitly use
-`/var/lib/codex-auth/auth.json`. These paths can be overridden with:
+`/var/lib/codex-auth/auth.json`. These paths can be overridden with absolute
+paths:
 
 - `CXA_ACCOUNT_STORE`
 - `CXA_ACTIVE_AUTH`
-- `CXA_CODEX_HOME`
+- `CODEX_HOME`
 - `CXA_SHARED_APP_SERVER_SOCKET`
 - `CXA_USAGE_TTL`
 - `CXA_SKIP_USAGE_REFRESH=1`
+
+The legacy `CXA_CODEX_HOME` override is accepted only when `CODEX_HOME` is
+set to the same path. This prevents cxa from switching a different session than
+ordinary Codex launches use.
 
 ## Safety model
 
@@ -102,17 +115,28 @@ can rotate it. If `cxa` is killed or the machine loses power, the next run
 either restores the previous credential or completes promotion of the rotated
 credential.
 
-Account identity includes the workspace account ID and ChatGPT user ID, not
-just the email address. This keeps users and workspaces with the same email
-distinct.
+Account identity includes the ChatGPT user ID and, when present, the workspace
+account ID—not just the email address. This keeps users and workspaces with the
+same email distinct while supporting personal accounts without a workspace ID.
 
 `cxa` treats failed writer detection conservatively. If it cannot prove that
 Codex is stopped, it refuses credential changes.
 
 ## Linux shared app server
 
-The optional service setup assumes a local `openclaw` group and installs three
-system units. Build and install everything with:
+The optional service setup requires the login user to belong to a local
+`openclaw` group and installs four
+system units. The installer records the Codex home, account store, service
+credential and socket paths, and absolute Codex executable in
+`~/.config/cxa/service.env` so the system service and CLI use the same paths and
+installation. Build and install everything with:
+
+```sh
+sudo groupadd --system openclaw 2>/dev/null || true
+sudo usermod -aG openclaw "$USER"
+```
+
+Start a new login session after adding the group, then build and install:
 
 ```sh
 ./install.sh --systemd
@@ -122,9 +146,27 @@ Provision the credential directory and link the login user's Codex home:
 
 ```sh
 sudo install -d -m 0700 -o "$USER" -g openclaw /var/lib/codex-auth
-install -d -m 0700 "$HOME/.codex"
-ln -sfn /var/lib/codex-auth/auth.json "$HOME/.codex/auth.json"
+CXA_ACTIVE_AUTH=/var/lib/codex-auth/auth.json cxa relink
 ```
+
+Run the installer and migration as the login user; it invokes `sudo` only for
+the system files. `cxa relink` copies the selected credential into the service
+path before atomically linking the Codex session to it.
+
+If either persistent path changes later, rerun the installer with the new
+environment values before restarting the service.
+
+The shared socket and active credential under `/var/lib/codex-auth` are
+singleton machine state. Systemd installation therefore requires
+`CXA_ACTIVE_AUTH=/var/lib/codex-auth/auth.json` and
+`CXA_SHARED_APP_SERVER_SOCKET=/var/lib/codex-auth/app-server.sock`; custom
+values for those two overrides are rejected. The installer refuses to transfer an existing
+directory to a different login user. While the app server is running, its
+verified socket directory is root-owned and non-writable; rerunning the
+installer recognizes and preserves that published state. The service reloads
+`auth.json` through Codex's guarded account refresh before each quota read, and
+its refresh-token endpoint is redirected to an unbindable local address so it
+cannot rotate credentials. Ordinary Codex remains the only OAuth refresh owner.
 
 After enrolling and selecting the first account, start the services:
 
@@ -138,7 +180,8 @@ only:
 
 - `initialize`
 - `initialized`
-- `account/read`, forced to `refreshToken: false`
+- `account/read`, forced to `refreshToken: true` so Codex reloads credentials
+  changed by the ordinary Codex process before reading quota
 - `account/rateLimits/read`
 - `account/rateLimits/updated` notifications
 

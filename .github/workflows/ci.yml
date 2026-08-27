@@ -10,6 +10,16 @@ permissions:
   contents: read
 
 jobs:
+  workflow-lint:
+    name: Lint workflows
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - name: Install actionlint
+        run: go install github.com/rhysd/actionlint/cmd/actionlint@v1.7.12
+      - name: Check workflows
+        run: '"$(go env GOPATH)/bin/actionlint" -color'
+
   check:
     name: Check (${{ matrix.name }})
     strategy:
@@ -22,7 +32,7 @@ jobs:
             runner: macos-15
     runs-on: ${{ matrix.runner }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
       - run: rustup update stable --no-self-update
       - run: rustup component add rustfmt clippy
       - run: ./scripts/check.sh

@@ -1,7 +1,6 @@
 class Cxa < Formula
   desc "Fast, crash-safe account switcher for Codex ChatGPT OAuth accounts"
   homepage "https://github.com/jesse-merhi/cxa"
-  version "@VERSION@"
   license "MIT"
 
   on_macos do

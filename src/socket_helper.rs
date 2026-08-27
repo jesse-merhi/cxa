@@ -10,16 +10,20 @@ use std::time::{Duration, Instant};
 use nix::fcntl::{OFlag, open};
 use nix::sys::stat::{Mode, fchmod};
 use nix::unistd::{Gid, Group, Uid, User, fchown};
+use tungstenite::client;
 use tungstenite::client::IntoClientRequest;
 use tungstenite::handshake::HandshakeError;
-use tungstenite::{client, http};
 
+use crate::fs::DeadlineUnixStream;
 use crate::{Error, Result};
 
 pub const SOCKET_DIR: &str = "/var/lib/codex-auth";
 pub const SOCKET_NAME: &str = "app-server.sock";
 pub const OPENCLAW_GROUP: &str = "openclaw";
 pub const PROC_ROOT: &str = "/proc";
+const WRITABLE_DIRECTORY_MODE: libc::mode_t = 0o700;
+const PUBLISHED_DIRECTORY_MODE: libc::mode_t = 0o2511;
+const PUBLISHED_SOCKET_MODE: u32 = 0o600;
 
 #[derive(Clone, Copy, Debug)]
 struct Identity {
@@ -57,14 +61,20 @@ fn open_directory(path: &Path, identity: Identity) -> Result<OwnedFd> {
 }
 
 fn take_directory(descriptor: &OwnedFd, identity: Identity) -> Result<()> {
-    fchmod(descriptor, Mode::from_bits_truncate(0o2500))?;
     fchown(descriptor, Some(Uid::from_raw(0)), Some(identity.gid))?;
+    fchmod(
+        descriptor,
+        Mode::from_bits_truncate(PUBLISHED_DIRECTORY_MODE),
+    )?;
     Ok(())
 }
 
 fn restore_directory(descriptor: &OwnedFd, identity: Identity) -> Result<()> {
-    fchmod(descriptor, Mode::from_bits_truncate(0o700))?;
     fchown(descriptor, Some(identity.uid), Some(identity.gid))?;
+    fchmod(
+        descriptor,
+        Mode::from_bits_truncate(WRITABLE_DIRECTORY_MODE),
+    )?;
     Ok(())
 }
 
@@ -184,27 +194,62 @@ fn peer_credentials(_stream: &UnixStream) -> Result<(u32, u32)> {
     ))
 }
 
-fn verify_websocket(stream: UnixStream) -> Result<tungstenite::WebSocket<UnixStream>> {
-    stream
-        .set_read_timeout(Some(Duration::from_secs(1)))
-        .map_err(|error| Error::io("app-server socket", error))?;
-    stream
-        .set_write_timeout(Some(Duration::from_secs(1)))
-        .map_err(|error| Error::io("app-server socket", error))?;
-    let mut request = "ws://localhost/ready"
+fn verify_websocket(
+    stream: UnixStream,
+    deadline: Instant,
+) -> Result<tungstenite::WebSocket<DeadlineUnixStream>> {
+    let request = "ws://localhost/ready"
         .into_client_request()
         .map_err(|error| Error::Protocol(error.to_string()))?;
-    request.headers_mut().insert(
-        http::header::SEC_WEBSOCKET_PROTOCOL,
-        http::HeaderValue::from_static("codex-app-server"),
-    );
+    let stream = DeadlineUnixStream::new(stream, deadline);
     let (websocket, _) = client(request, stream).map_err(|error| match error {
         HandshakeError::Failure(error) => Error::WebSocket(error),
-        HandshakeError::Interrupted(_) => {
-            Error::Protocol("blocking WebSocket handshake was interrupted".into())
-        }
+        HandshakeError::Interrupted(_) => Error::Timeout,
     })?;
     Ok(websocket)
+}
+
+fn wait_for_websocket<T>(
+    deadline: Instant,
+    handshake_timeout: Duration,
+    mut candidate: impl FnMut() -> Result<Option<(T, UnixStream)>>,
+) -> Result<(T, tungstenite::WebSocket<DeadlineUnixStream>)> {
+    loop {
+        if Instant::now() >= deadline {
+            return Err(Error::Message(
+                "fresh app-server listener did not become ready".into(),
+            ));
+        }
+        let Some((state, stream)) = candidate()? else {
+            std::thread::sleep(Duration::from_millis(50));
+            continue;
+        };
+        let attempt_deadline = deadline.min(Instant::now() + handshake_timeout);
+        match verify_websocket(stream, attempt_deadline) {
+            Ok(websocket) => return Ok((state, websocket)),
+            Err(error) if transient_handshake_error(&error) => {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+fn transient_handshake_error(error: &Error) -> bool {
+    matches!(error, Error::Timeout)
+        || matches!(
+            error,
+            Error::WebSocket(tungstenite::Error::Io(source))
+            if matches!(
+                source.kind(),
+                std::io::ErrorKind::WouldBlock
+                    | std::io::ErrorKind::TimedOut
+                    | std::io::ErrorKind::ConnectionReset
+                    | std::io::ErrorKind::ConnectionAborted
+                    | std::io::ErrorKind::BrokenPipe
+                    | std::io::ErrorKind::UnexpectedEof
+            )
+        )
 }
 
 pub fn publish(user_name: &str, expected_pid: u32) -> Result<()> {
@@ -213,19 +258,12 @@ pub fn publish(user_name: &str, expected_pid: u32) -> Result<()> {
     let descriptor = open_directory(directory, identity)?;
     let path = socket_path(directory);
     let deadline = Instant::now() + Duration::from_secs(10);
-    let (before, mut websocket) = loop {
-        if Instant::now() >= deadline {
-            return Err(Error::Message(
-                "fresh app-server listener did not become ready".into(),
-            ));
-        }
+    let (before, mut websocket) = wait_for_websocket(deadline, Duration::from_secs(1), || {
         let Some(metadata) = socket_metadata(&path)? else {
-            std::thread::sleep(Duration::from_millis(50));
-            continue;
+            return Ok(None);
         };
         let Ok(stream) = UnixStream::connect(&path) else {
-            std::thread::sleep(Duration::from_millis(50));
-            continue;
+            return Ok(None);
         };
         let (peer_pid, peer_uid) = peer_credentials(&stream)?;
         if peer_uid != identity.uid.as_raw()
@@ -235,9 +273,8 @@ pub fn publish(user_name: &str, expected_pid: u32) -> Result<()> {
                 "socket belongs to an unexpected process".into(),
             ));
         }
-        let websocket = verify_websocket(stream)?;
-        break (metadata, websocket);
-    };
+        Ok(Some((metadata, stream)))
+    })?;
     take_directory(&descriptor, identity)?;
     let result = (|| {
         let after = socket_metadata(&path)?
@@ -247,12 +284,14 @@ pub fn publish(user_name: &str, expected_pid: u32) -> Result<()> {
                 "app-server socket changed while publishing permissions".into(),
             ));
         }
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o600))
+        fs::set_permissions(&path, fs::Permissions::from_mode(PUBLISHED_SOCKET_MODE))
             .map_err(|error| Error::io(&path, error))
     })();
     let _ = websocket.close(None);
-    let restored = restore_directory(&descriptor, identity);
-    result.and(restored)
+    if result.is_err() {
+        return result.and(restore_directory(&descriptor, identity));
+    }
+    result
 }
 
 pub fn require_root() -> Result<()> {
@@ -267,7 +306,46 @@ pub fn require_root() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::net::UnixStream;
     use tempfile::tempdir;
+
+    #[test]
+    fn readiness_handshake_accepts_codex_without_a_subprotocol() {
+        let (client, server) = UnixStream::pair().unwrap();
+        let server = std::thread::spawn(move || tungstenite::accept(server).unwrap());
+
+        let websocket = verify_websocket(client, Instant::now() + Duration::from_secs(1));
+
+        assert!(websocket.is_ok(), "{websocket:?}");
+        drop(websocket);
+        drop(server.join().unwrap());
+    }
+
+    #[test]
+    fn readiness_handshake_retries_transient_timeouts_until_the_deadline() {
+        let mut attempts = 0;
+        let result = wait_for_websocket(
+            Instant::now() + Duration::from_secs(1),
+            Duration::from_millis(20),
+            || {
+                attempts += 1;
+                let (client, server) = UnixStream::pair().unwrap();
+                let delay = if attempts == 1 {
+                    Duration::from_millis(75)
+                } else {
+                    Duration::ZERO
+                };
+                std::thread::spawn(move || {
+                    std::thread::sleep(delay);
+                    let _ = tungstenite::accept(server);
+                });
+                Ok(Some(((), client)))
+            },
+        );
+
+        assert!(result.is_ok(), "{result:?}");
+        assert!(attempts >= 2);
+    }
 
     #[test]
     fn accepts_native_child_in_the_service_cgroup() {
@@ -293,5 +371,13 @@ mod tests {
             fs::write(process.join("cgroup"), format!("0::/user.slice/{cgroup}\n")).unwrap();
         }
         assert!(!listener_belongs_to_service(root.path(), 200, 100));
+    }
+
+    #[test]
+    fn published_state_is_traversable_but_not_mutable() {
+        assert_eq!(PUBLISHED_DIRECTORY_MODE & 0o222, 0);
+        assert_eq!(PUBLISHED_DIRECTORY_MODE & 0o111, 0o111);
+        assert_eq!(PUBLISHED_SOCKET_MODE, 0o600);
+        assert_eq!(WRITABLE_DIRECTORY_MODE, 0o700);
     }
 }
