@@ -21,8 +21,12 @@ assert_contract(workflow.dig("concurrency", "queue") == "max", "release runs mus
 
 tag_verification = named_step(jobs.fetch("verify"), "Verify tag matches Cargo version").fetch("run", "")
 assert_contract(
-  tag_verification.include?('"$tag_version" != "$version"-*'),
-  "release verification must accept prerelease suffixes"
+  tag_verification.include?('[[ "$tag_version" != "$version" ]]'),
+  "release verification must require the full Cargo version"
+)
+assert_contract(
+  tag_verification.include?('[[ "$tag_version" == *+* ]]'),
+  "release verification must reject build metadata before publishing"
 )
 
 linux_build = jobs.fetch("build-linux")
@@ -78,6 +82,10 @@ assert_contract(
 assert_contract(
   named_step(brew_validation, "Update formula").fetch("run", "").include?("mkdir -p homebrew-tap/Formula"),
   "formula validation must create the tap directory"
+)
+assert_contract(
+  named_step(brew_validation, "Validate formula").fetch("run", "").include?('mkdir -p "$(dirname "$tap_formula")"'),
+  "formula validation must create the tapped Formula directory"
 )
 
 brew_publish = jobs.fetch("homebrew")

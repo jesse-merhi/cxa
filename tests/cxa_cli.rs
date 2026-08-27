@@ -12,6 +12,7 @@ struct Case {
     _root: TempDir,
     home: PathBuf,
     codex_home: PathBuf,
+    codex: PathBuf,
     store: PathBuf,
 }
 
@@ -20,12 +21,38 @@ impl Case {
         let root = tempfile::tempdir().unwrap();
         let home = root.path().join("home");
         let codex_home = home.join(".codex");
+        let codex = home.join("fake-codex");
         let store = home.join(".codex-auth");
         fs::create_dir_all(&codex_home).unwrap();
+        write_executable(
+            &codex,
+            r#"#!/bin/sh
+case "$*" in
+*app-server*)
+  mode=${FAKE_CREDENTIAL_STORE:-file}
+  while IFS= read -r line; do
+    case "$line" in
+      *'"id":0'*) printf '%s\n' '{"id":0,"result":{}}' ;;
+      *'"method":"config/read"'*)
+        printf '{"id":1,"result":{"config":{"cli_auth_credentials_store":"%s"}}}\n' "$mode"
+        ;;
+    esac
+  done
+  exit 0
+  ;;
+esac
+if [ "$1" = login ] && [ -n "$FAKE_AUTH" ]; then
+  cp "$FAKE_AUTH" "$CODEX_HOME/auth.json"
+  exit 0
+fi
+exit 1
+"#,
+        );
         Self {
             _root: root,
             home,
             codex_home,
+            codex,
             store,
         }
     }
@@ -35,9 +62,13 @@ impl Case {
         command
             .env("HOME", &self.home)
             .env("CODEX_HOME", &self.codex_home)
+            .env("CXA_CODEX_BIN", &self.codex)
             .env("CXA_ACCOUNT_STORE", &self.store)
             .env("CXA_SKIP_USAGE_REFRESH", "1")
-            .env("NO_COLOR", "1");
+            .env_remove("CODEX_ACCESS_TOKEN")
+            .env_remove("CODEX_API_KEY")
+            .env_remove("OPENAI_API_KEY")
+            .env_remove("NO_COLOR");
         command
     }
 
@@ -68,6 +99,24 @@ fn assert_success(output: &Output) {
 }
 
 fn write_auth(path: &Path, email: &str, user_id: &str, account_id: &str, access_token: &str) {
+    write_auth_at(
+        path,
+        email,
+        user_id,
+        account_id,
+        access_token,
+        "2026-08-28T00:00:00Z",
+    );
+}
+
+fn write_auth_at(
+    path: &Path,
+    email: &str,
+    user_id: &str,
+    account_id: &str,
+    access_token: &str,
+    last_refresh: &str,
+) {
     let claims = json!({
         "email": email,
         "https://api.openai.com/auth": {"chatgpt_user_id": user_id}
@@ -77,7 +126,7 @@ fn write_auth(path: &Path, email: &str, user_id: &str, account_id: &str, access_
         URL_SAFE_NO_PAD.encode(serde_json::to_vec(&claims).unwrap())
     );
     let value = json!({
-        "last_refresh": "2026-08-28T00:00:00Z",
+        "last_refresh": last_refresh,
         "tokens": {
             "id_token": id_token,
             "access_token": access_token,
@@ -139,6 +188,24 @@ fn bare_command_recommends_init_for_the_current_login() {
 }
 
 #[test]
+fn redirected_init_requires_yes_without_creating_a_profile() {
+    let case = Case::new();
+    write_auth(
+        &case.codex_home.join("auth.json"),
+        "current@example.com",
+        "user-current",
+        "account-current",
+        "current",
+    );
+
+    let output = case.run(&["init"]);
+
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("cxa init --yes"));
+    assert!(!case.store.join("profile-1/auth.json").exists());
+}
+
+#[test]
 fn init_imports_and_selects_the_current_login() {
     let case = Case::new();
     case.seed("one@example.com", "user-one", "account-one");
@@ -164,7 +231,7 @@ fn switch_works_while_codex_is_running_and_prints_restart_guidance() {
     assert_success(&case.run(&["import", imported.to_str().unwrap()]));
     let (_codex, mut child) = sleeping_codex(&case);
 
-    let output = case.run(&["2"]);
+    let output = case.run(&["use", "2"]);
     let _ = child.kill();
     let _ = child.wait();
 
@@ -176,6 +243,31 @@ fn switch_works_while_codex_is_running_and_prints_restart_guidance() {
     assert!(String::from_utf8_lossy(&output.stdout).contains(
         "Restart Codex or ChatGPT before expecting an existing session to use this account."
     ));
+}
+
+#[test]
+fn switching_preserves_live_credentials_when_timestamps_tie() {
+    let case = Case::new();
+    case.seed("one@example.com", "user-one", "account-one");
+    let second = case.home.join("second.json");
+    write_auth(&second, "two@example.com", "user-two", "account-two", "two");
+    assert_success(&case.run(&["import", second.to_str().unwrap()]));
+    write_auth_at(
+        &case.codex_home.join("auth.json"),
+        "one@example.com",
+        "user-one",
+        "account-one",
+        "refreshed-one",
+        "2026-08-28T00:00:00Z",
+    );
+
+    assert_success(&case.run(&["2"]));
+    assert_success(&case.run(&["1"]));
+
+    assert_eq!(
+        access_token(&case.codex_home.join("auth.json")),
+        "refreshed-one"
+    );
 }
 
 #[test]
@@ -259,15 +351,8 @@ fn add_runs_login_in_an_isolated_home() {
         "account-two",
         "token-two",
     );
-    let codex = case.home.join("fake-codex");
-    write_executable(
-        &codex,
-        "#!/bin/sh\nif [ \"$1\" = login ]; then cp \"$FAKE_AUTH\" \"$CODEX_HOME/auth.json\"; exit 0; fi\nexit 1\n",
-    );
-
     let output = case
         .command()
-        .env("CXA_CODEX_BIN", &codex)
         .env("FAKE_AUTH", &fresh)
         .arg("add")
         .output()
@@ -296,15 +381,8 @@ fn relogin_rejects_a_different_account() {
         "wrong-account",
         "wrong",
     );
-    let codex = case.home.join("fake-codex");
-    write_executable(
-        &codex,
-        "#!/bin/sh\ncp \"$FAKE_AUTH\" \"$CODEX_HOME/auth.json\"\n",
-    );
-
     let output = case
         .command()
-        .env("CXA_CODEX_BIN", &codex)
         .env("FAKE_AUTH", &wrong)
         .args(["relogin", "1"])
         .output()
@@ -329,15 +407,8 @@ fn selected_relogin_updates_the_session_and_prints_restart_guidance() {
         "account-one",
         "replacement",
     );
-    let codex = case.home.join("fake-codex");
-    write_executable(
-        &codex,
-        "#!/bin/sh\ncp \"$FAKE_AUTH\" \"$CODEX_HOME/auth.json\"\n",
-    );
-
     let output = case
         .command()
-        .env("CXA_CODEX_BIN", &codex)
         .env("FAKE_AUTH", &replacement)
         .args(["relogin", "1"])
         .output()
@@ -352,13 +423,34 @@ fn selected_relogin_updates_the_session_and_prints_restart_guidance() {
 }
 
 #[test]
-fn list_reads_quota_from_an_isolated_app_server_without_refreshing_tokens() {
+fn list_preserves_rotation_and_restart_guidance_when_quota_fails() {
     let case = Case::new();
     case.seed("one@example.com", "user-one", "account-one");
+    let refreshed = case.home.join("refreshed.json");
+    write_auth_at(
+        &refreshed,
+        "one@example.com",
+        "user-one",
+        "account-one",
+        "refreshed-one",
+        "2026-08-28T00:00:00Z",
+    );
     let codex = case.home.join("fake-codex");
     write_executable(
         &codex,
         r#"#!/bin/sh
+case "$CODEX_HOME" in
+  "$CXA_ACCOUNT_STORE"/.quota-*) ;;
+  *)
+    while IFS= read -r line; do
+      case "$line" in
+        *'"id":0'*) printf '%s\n' '{"id":0,"result":{}}' ;;
+        *'"method":"config/read"'*) printf '%s\n' '{"id":1,"result":{"config":{"cli_auth_credentials_store":"file"}}}' ;;
+      esac
+    done
+    exit 0
+    ;;
+esac
 while IFS= read -r line; do
   case "$line" in
     *'"id":0'*) printf '%s\n' '{"id":0,"result":{}}' ;;
@@ -366,7 +458,72 @@ while IFS= read -r line; do
       case "$line" in *'"refreshToken":false'*) ;; *) exit 2 ;; esac
       printf '%s\n' '{"id":1,"result":{}}'
       ;;
-    *'"id":2'*) printf '%s\n' '{"id":2,"result":{"rateLimits":{"primary":{"usedPercent":42.0,"resetsAt":1999999999},"credits":{"hasCredits":true,"unlimited":false}}}}' ;;
+    *'"id":2'*)
+      cp "$FAKE_REFRESHED" "$CODEX_HOME/auth.json"
+      printf '%s\n' '{"id":2,"error":{"code":-32000,"message":"quota failed"}}'
+      ;;
+  esac
+done
+"#,
+    );
+
+    let output = case
+        .command()
+        .env_remove("CXA_SKIP_USAGE_REFRESH")
+        .env("CXA_CODEX_BIN", &codex)
+        .env("FAKE_REFRESHED", &refreshed)
+        .arg("list")
+        .output()
+        .unwrap();
+
+    assert_success(&output);
+    assert!(String::from_utf8_lossy(&output.stdout).contains("quota unavailable (Protocol)"));
+    assert!(String::from_utf8_lossy(&output.stdout).contains("Restart Codex or ChatGPT"));
+    assert_eq!(
+        access_token(&case.store.join("profile-1/auth.json")),
+        "refreshed-one"
+    );
+    assert_eq!(
+        access_token(&case.codex_home.join("auth.json")),
+        "refreshed-one"
+    );
+}
+
+#[test]
+fn list_attributes_quota_to_each_saved_profile() {
+    let case = Case::new();
+    case.seed("one@example.com", "user-one", "account-one");
+    let second = case.home.join("second.json");
+    write_auth(
+        &second,
+        "two@example.com",
+        "user-two",
+        "account-two",
+        "token-two",
+    );
+    assert_success(&case.run(&["import", second.to_str().unwrap()]));
+    let codex = case.home.join("fake-codex");
+    write_executable(
+        &codex,
+        r#"#!/bin/sh
+case "$CODEX_HOME" in
+  "$CXA_ACCOUNT_STORE"/.quota-*) ;;
+  *)
+    while IFS= read -r line; do
+      case "$line" in
+        *'"id":0'*) printf '%s\n' '{"id":0,"result":{}}' ;;
+        *'"method":"config/read"'*) printf '%s\n' '{"id":1,"result":{"config":{"cli_auth_credentials_store":"file"}}}' ;;
+      esac
+    done
+    exit 0
+    ;;
+esac
+if grep -q token-one "$CODEX_HOME/auth.json"; then used=11; else used=77; fi
+while IFS= read -r line; do
+  case "$line" in
+    *'"id":0'*) printf '%s\n' '{"id":0,"result":{}}' ;;
+    *'"id":1'*) printf '%s\n' '{"id":1,"result":{}}' ;;
+    *'"id":2'*) printf '{"id":2,"result":{"rateLimits":{"primary":{"usedPercent":%s}}}}\n' "$used" ;;
   esac
 done
 "#,
@@ -381,11 +538,9 @@ done
         .unwrap();
 
     assert_success(&output);
-    assert!(String::from_utf8_lossy(&output.stdout).contains("primary 42% used"));
-    assert_eq!(
-        access_token(&case.store.join("profile-1/auth.json")),
-        "token-one"
-    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("primary 11% used"));
+    assert!(stdout.contains("primary 77% used"));
 }
 
 #[test]
@@ -454,5 +609,91 @@ fn informational_flags_do_not_require_home_configuration() {
         .unwrap();
 
     assert_success(&output);
-    assert!(String::from_utf8_lossy(&output.stdout).starts_with("cxa 0.1.0"));
+    assert!(
+        String::from_utf8_lossy(&output.stdout)
+            .starts_with(&format!("cxa {}", env!("CARGO_PKG_VERSION")))
+    );
+}
+
+#[test]
+fn absolute_path_overrides_do_not_require_home() {
+    let case = Case::new();
+    case.seed("one@example.com", "user-one", "account-one");
+
+    let output = case
+        .command()
+        .env_remove("HOME")
+        .arg("status")
+        .output()
+        .unwrap();
+
+    assert_success(&output);
+    assert!(String::from_utf8_lossy(&output.stdout).contains("one@example.com"));
+}
+
+#[test]
+fn non_file_codex_credentials_are_rejected_before_switching() {
+    let case = Case::new();
+    case.seed("one@example.com", "user-one", "account-one");
+    let output = case
+        .command()
+        .env("FAKE_CREDENTIAL_STORE", "keyring")
+        .arg("1")
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("cxa requires Codex's file credential store")
+    );
+}
+
+#[test]
+fn malformed_enrolled_profile_is_reported() {
+    let case = Case::new();
+    case.seed("one@example.com", "user-one", "account-one");
+    let profile = case.store.join("profile-2");
+    fs::create_dir_all(&profile).unwrap();
+    fs::write(profile.join("auth.json"), b"not json").unwrap();
+
+    let output = case.run(&["list"]);
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("profile-2/auth.json"));
+    assert!(stderr.contains("invalid JSON"));
+}
+
+#[test]
+fn credential_environment_overrides_are_rejected_before_switching() {
+    let case = Case::new();
+    case.seed("one@example.com", "user-one", "account-one");
+
+    let output = case
+        .command()
+        .env("CODEX_ACCESS_TOKEN", "external-token")
+        .arg("1")
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("Unset CODEX_ACCESS_TOKEN"));
+}
+
+#[test]
+fn api_key_environment_does_not_block_file_credentials() {
+    let case = Case::new();
+    case.seed("one@example.com", "user-one", "account-one");
+
+    let output = case
+        .command()
+        .env("OPENAI_API_KEY", "unrelated")
+        .env("CODEX_API_KEY", "unrelated")
+        .arg("status")
+        .output()
+        .unwrap();
+
+    assert_success(&output);
+    assert!(String::from_utf8_lossy(&output.stdout).contains("one@example.com"));
 }

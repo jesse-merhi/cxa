@@ -1,5 +1,5 @@
 use std::ffi::OsString;
-use std::io::{self, IsTerminal};
+use std::io::{self, IsTerminal, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -9,7 +9,7 @@ use clap::{Parser, Subcommand};
 use tempfile::Builder;
 
 use crate::account_store::{Store, UsageRecord, now_epoch};
-use crate::app_server::query_profile;
+use crate::app_server::{query_profile, require_file_credentials};
 use crate::auth::AuthDocument;
 use crate::config::Config;
 use crate::fs::{ExclusiveLock, atomic_copy, private_dir, remove_file_if_exists};
@@ -57,6 +57,7 @@ enum CliCommand {
 }
 
 pub fn run(cli: Cli, config: Config) -> Result<()> {
+    require_file_credentials(&config)?;
     let app = App::new(config);
     match (cli.command, cli.account) {
         (Some(CliCommand::Init { yes }), _) => app.init(yes),
@@ -81,7 +82,9 @@ impl App {
     }
 
     fn locked(&self) -> Result<ExclusiveLock> {
-        self.store.lock()
+        let lock = self.store.lock()?;
+        self.store.sync_session_profile()?;
+        Ok(lock)
     }
 
     fn init(&self, assume_yes: bool) -> Result<()> {
@@ -110,7 +113,7 @@ impl App {
         }
         let current = AuthDocument::read(session_path)?;
         if !assume_yes {
-            if !confirmation_is_interactive(io::stdin().is_terminal(), io::stdout().is_terminal()) {
+            if !(io::stdin().is_terminal() && io::stdout().is_terminal()) {
                 return Err(Error::Message(format!(
                     "Found the current Codex login: {}. Run `cxa init --yes` when input or output is redirected.",
                     current.identity.label()
@@ -120,6 +123,9 @@ impl App {
                 "{ACCENT}?{ACCENT:#} Found the current Codex login: {EMPHASIS}{}{EMPHASIS:#}\n  Import it as account {ACCENT}1{ACCENT:#}? {MUTED}[Y/n]{MUTED:#} ",
                 current.identity.label()
             );
+            io::stdout()
+                .flush()
+                .map_err(|error| Error::io("stdout", error))?;
             let mut answer = String::new();
             io::stdin()
                 .read_line(&mut answer)
@@ -150,8 +156,9 @@ impl App {
             println!("{}", self.initialization_guidance());
             return Ok(());
         }
+        let mut session_changed = false;
         for profile in &profiles {
-            self.refresh_usage(profile.slot)?;
+            session_changed |= self.refresh_usage(profile.slot)?;
         }
         let selected = self.store.selected();
         for profile in profiles {
@@ -171,6 +178,9 @@ impl App {
                 profile.auth.identity.label()
             );
         }
+        if session_changed {
+            restart_notice();
+        }
         Ok(())
     }
 
@@ -184,10 +194,12 @@ impl App {
             .store
             .selected()
             .ok_or_else(|| Error::Message("No Codex account is selected.".into()))?;
-        if refresh {
-            self.refresh_usage(selected)?;
+        let session_changed = refresh && self.refresh_usage(selected)?;
+        self.print_status_lines()?;
+        if session_changed {
+            restart_notice();
         }
-        self.print_status_lines()
+        Ok(())
     }
 
     fn initialization_guidance(&self) -> String {
@@ -200,17 +212,19 @@ impl App {
         }
     }
 
-    fn refresh_usage(&self, slot: u32) -> Result<()> {
+    fn refresh_usage(&self, slot: u32) -> Result<bool> {
         if self.store.config.skip_usage_refresh || self.store.usage_fresh(slot) {
-            return Ok(());
+            return Ok(false);
         }
         let previous = self.store.usage(slot);
-        let next = query_profile(&self.store.config, &self.store.config.profile_auth(slot));
+        let (next, session_changed) =
+            query_profile(&self.store.config, &self.store.config.profile_auth(slot));
         write_usage_result(
             previous.as_ref(),
             &next,
             &self.store.config.profile_usage(slot),
-        )
+        )?;
+        Ok(session_changed)
     }
 
     fn switch(&self, selector: &str) -> Result<()> {
@@ -310,10 +324,6 @@ fn restart_notice() {
     );
 }
 
-fn confirmation_is_interactive(stdin: bool, stdout: bool) -> bool {
-    stdin && stdout
-}
-
 fn usage_style(usage: Option<&UsageRecord>, now: i64) -> Style {
     let Some(usage) = usage else {
         return WARNING;
@@ -322,10 +332,7 @@ fn usage_style(usage: Option<&UsageRecord>, now: i64) -> Style {
     if usage.exhausted_now(now) || max_used.is_some_and(|percent| percent >= 100.0) {
         return ERROR;
     }
-    if !usage.succeeded()
-        || usage.credits_depleted()
-        || max_used.is_some_and(|percent| percent >= 80.0)
-    {
+    if !usage.succeeded() || max_used.is_some_and(|percent| percent >= 80.0) {
         WARNING
     } else {
         SUCCESS
@@ -352,10 +359,14 @@ fn write_usage_result(
     next: &UsageRecord,
     path: &Path,
 ) -> Result<()> {
-    if next.succeeded() || previous.is_none_or(|usage| !usage.succeeded()) {
-        next.write(path)?;
+    if !next.succeeded() {
+        if let Some(previous) = previous.filter(|usage| usage.succeeded()) {
+            let mut retained = previous.clone();
+            retained.last_attempted_at = next.last_attempted_at.max(next.observed_at);
+            return retained.write(path);
+        }
     }
-    Ok(())
+    next.write(path)
 }
 
 fn reject_non_oauth(options: &[OsString]) -> Result<()> {
@@ -413,9 +424,27 @@ mod tests {
     use super::*;
 
     #[test]
-    fn confirmation_requires_visible_input_and_output() {
-        assert!(confirmation_is_interactive(true, true));
-        assert!(!confirmation_is_interactive(true, false));
-        assert!(!confirmation_is_interactive(false, true));
+    fn failed_refresh_preserves_successful_usage() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("usage.json");
+        let previous = UsageRecord {
+            observed_at: 1,
+            last_attempted_at: 1,
+            ..UsageRecord::default()
+        };
+        previous.write(&path).unwrap();
+        let failed = UsageRecord {
+            observed_at: 2,
+            last_attempted_at: 2,
+            error: Some("quota unavailable (Timeout)".into()),
+            ..UsageRecord::default()
+        };
+
+        write_usage_result(Some(&previous), &failed, &path).unwrap();
+
+        let retained = UsageRecord::read(&path).unwrap();
+        assert_eq!(retained.observed_at, 1);
+        assert_eq!(retained.last_attempted_at, 2);
+        assert!(retained.succeeded());
     }
 }

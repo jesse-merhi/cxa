@@ -16,12 +16,23 @@ pub struct Config {
 
 impl Config {
     pub fn from_env() -> Result<Self> {
-        let home = env::var_os("HOME")
-            .map(PathBuf::from)
-            .ok_or_else(|| Error::Message("HOME is not set".into()))?;
-        let codex_home = env_path("CODEX_HOME")?.unwrap_or_else(|| home.join(".codex"));
-        let account_store =
-            env_path("CXA_ACCOUNT_STORE")?.unwrap_or_else(|| home.join(".codex-auth"));
+        let codex_home = env_path("CODEX_HOME")?;
+        let account_store = env_path("CXA_ACCOUNT_STORE")?;
+        let home = if codex_home.is_none() || account_store.is_none() {
+            Some(
+                env::var_os("HOME")
+                    .map(PathBuf::from)
+                    .ok_or_else(|| Error::Message("HOME is not set".into()))?,
+            )
+        } else {
+            None
+        };
+        let codex_home = codex_home
+            .or_else(|| home.as_ref().map(|home| home.join(".codex")))
+            .expect("HOME is available when CODEX_HOME is omitted");
+        let account_store = account_store
+            .or_else(|| home.as_ref().map(|home| home.join(".codex-auth")))
+            .expect("HOME is available when CXA_ACCOUNT_STORE is omitted");
         let codex_binary = env_path("CXA_CODEX_BIN")?;
         let session_auth = codex_home.join("auth.json");
 
@@ -64,6 +75,16 @@ impl Config {
 
     pub fn codex_binary(&self) -> &Path {
         self.codex_binary.as_deref().unwrap_or(Path::new("codex"))
+    }
+
+    pub fn require_no_credential_override(&self) -> Result<()> {
+        if env::var_os("CODEX_ACCESS_TOKEN").is_some_and(|value| !value.is_empty()) {
+            return Err(Error::Message(
+                "cxa requires file-backed ChatGPT OAuth credentials. Unset CODEX_ACCESS_TOKEN, then run cxa again."
+                    .into(),
+            ));
+        }
+        Ok(())
     }
 }
 

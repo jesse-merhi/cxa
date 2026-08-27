@@ -1,11 +1,11 @@
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use base64::Engine as _;
 use base64::engine::general_purpose::{URL_SAFE, URL_SAFE_NO_PAD};
-use chrono::DateTime;
 use serde_json::Value;
 
+use crate::fs::atomic_write;
 use crate::{Error, Result};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -30,10 +30,9 @@ impl Identity {
 
 #[derive(Clone, Debug)]
 pub struct AuthDocument {
-    pub path: PathBuf,
     pub raw: Value,
     pub identity: Identity,
-    pub refresh_ns: i64,
+    bytes: Vec<u8>,
 }
 
 impl AuthDocument {
@@ -74,6 +73,10 @@ impl AuthDocument {
         let account_id = tokens
             .get("account_id")
             .and_then(Value::as_str)
+            .or_else(|| {
+                auth.and_then(|value| value.get("chatgpt_account_id"))
+                    .and_then(Value::as_str)
+            })
             .map(ToOwned::to_owned);
         let user_id = auth
             .and_then(|value| {
@@ -84,25 +87,38 @@ impl AuthDocument {
             })
             .map(ToOwned::to_owned);
         let email = email.map(ToOwned::to_owned);
-        let last_refresh = raw.get("last_refresh").and_then(Value::as_str);
-        let refresh_ns = last_refresh
-            .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
-            .and_then(|value| value.timestamp_nanos_opt())
-            .ok_or_else(|| Error::InvalidAuth(path.to_owned()))?;
         Ok(Self {
-            path: path.to_owned(),
             raw,
             identity: Identity {
                 email,
                 account_id,
                 user_id: user_id.ok_or_else(|| Error::InvalidAuth(path.to_owned()))?,
             },
-            refresh_ns,
+            bytes,
         })
     }
 
     pub fn same_credentials(&self, other: &Self) -> bool {
         self.raw.get("tokens") == other.raw.get("tokens")
+    }
+
+    pub fn write_to(&self, destination: &Path) -> Result<()> {
+        atomic_write(destination, &self.bytes, 0o600)
+    }
+
+    pub fn copy_to_same_account(&self, destination: &Path) -> Result<bool> {
+        let current = Self::read(destination)?;
+        if !self.identity.same_account(&current.identity) {
+            return Err(Error::Message(format!(
+                "Refusing to replace credentials for another account at {}.",
+                destination.display()
+            )));
+        }
+        if !self.same_credentials(&current) {
+            self.write_to(destination)?;
+            return Ok(true);
+        }
+        Ok(false)
     }
 }
 
@@ -154,9 +170,12 @@ mod tests {
     }
 
     #[test]
-    fn accepts_stable_personal_identity_without_email_or_workspace_claims() {
+    fn accepts_missing_timestamp_and_uses_claimed_workspace_identity() {
         let claims = serde_json::json!({
-            "https://api.openai.com/auth": {"chatgpt_user_id": "user-one"}
+            "https://api.openai.com/auth": {
+                "chatgpt_user_id": "user-one",
+                "chatgpt_account_id": "account-one"
+            }
         });
         let token = format!(
             "header.{}.signature",
@@ -171,8 +190,7 @@ mod tests {
                     "id_token": token,
                     "access_token": "access",
                     "refresh_token": "refresh"
-                },
-                "last_refresh": "2026-01-01T00:00:00Z"
+                }
             }))
             .unwrap(),
         )
@@ -180,8 +198,41 @@ mod tests {
 
         let auth = AuthDocument::read(&path).unwrap();
         assert_eq!(auth.identity.email, None);
-        assert_eq!(auth.identity.account_id, None);
+        assert_eq!(auth.identity.account_id.as_deref(), Some("account-one"));
         assert_eq!(auth.identity.user_id, "user-one");
-        assert_eq!(auth.identity.label(), "user-one");
+        assert_eq!(auth.identity.label(), "account-one");
+    }
+
+    #[test]
+    fn writes_the_snapshot_that_was_validated() {
+        let claims = serde_json::json!({
+            "https://api.openai.com/auth": {"chatgpt_user_id": "user-one"}
+        });
+        let token = format!(
+            "header.{}.signature",
+            URL_SAFE_NO_PAD.encode(serde_json::to_vec(&claims).unwrap())
+        );
+        let document = |access: &str| {
+            serde_json::to_vec(&serde_json::json!({
+                "tokens": {
+                    "id_token": token,
+                    "access_token": access,
+                    "refresh_token": format!("refresh-{access}"),
+                    "account_id": "account-one"
+                }
+            }))
+            .unwrap()
+        };
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source.json");
+        let destination = root.path().join("destination.json");
+        fs::write(&source, document("first")).unwrap();
+        let auth = AuthDocument::read(&source).unwrap();
+        fs::write(&source, document("second")).unwrap();
+
+        auth.write_to(&destination).unwrap();
+
+        let saved = AuthDocument::read(destination).unwrap();
+        assert_eq!(saved.raw["tokens"]["access_token"], "first");
     }
 }

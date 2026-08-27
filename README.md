@@ -32,6 +32,10 @@ Then import the Codex account that is already signed in:
 cxa init
 ```
 
+The source installer writes to `~/.local/bin`. If that directory is not on your
+`PATH`, run `~/.local/bin/cxa init` once or add the directory to `PATH`.
+Homebrew handles `PATH` for you.
+
 Use `cxa init --yes` when input or output is redirected.
 
 Tagged releases contain native archives for Linux x86-64/ARM64 and macOS
@@ -66,7 +70,9 @@ existing session to use the newly selected account.
 
 Quota reads run through a separate `codex app-server` process in an isolated
 temporary home for each saved profile. They do not switch the active account or
-refresh its OAuth token. If a saved access token has expired, run `cxa relogin
+force an OAuth refresh. If Codex proactively refreshes a near-expiry token while
+reading quota, cxa validates and saves the newer credentials back to that
+profile. If a saved refresh token is already invalid, run `cxa relogin
 <account>`.
 
 Profiles live under `~/.codex-auth/profile-N`. The selected account is inferred
@@ -78,6 +84,10 @@ absolute-path overrides are supported:
 - `CXA_CODEX_BIN`
 - `CXA_USAGE_TTL`
 - `CXA_SKIP_USAGE_REFRESH=1`
+
+cxa supports Codex's default file-backed credential store. If you have set
+`cli_auth_credentials_store` to `keyring`, `auto`, or `ephemeral`, change it to
+`file` and run `codex login` again before using cxa.
 
 ## Credential model
 

@@ -23,8 +23,12 @@ jobs:
         run: |
           version="$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | sed -n '1p')"
           tag_version="${GITHUB_REF_NAME#v}"
-          if [[ "$tag_version" != "$version" && "$tag_version" != "$version"-* ]]; then
+          if [[ "$tag_version" != "$version" ]]; then
             printf 'Tag %s does not match Cargo version %s.\n' "$GITHUB_REF_NAME" "$version" >&2
+            exit 1
+          fi
+          if [[ "$tag_version" == *+* ]]; then
+            printf 'Build metadata is not supported in release versions: %s.\n' "$tag_version" >&2
             exit 1
           fi
       - run: ./scripts/check.sh
@@ -242,6 +246,7 @@ jobs:
           if [[ ! -f "$tap_formula" ]]; then
             audit_args+=(--new)
           fi
+          mkdir -p "$(dirname "$tap_formula")"
           install -m 0644 homebrew-tap/Formula/cxa.rb "$tap_formula"
           brew audit "${audit_args[@]}" jesse-merhi/tap/cxa
           brew install jesse-merhi/tap/cxa

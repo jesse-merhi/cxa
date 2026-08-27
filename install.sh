@@ -65,7 +65,7 @@ if [[ "$login_user" != "$current_user" ]]; then
   }
 fi
 
-if [[ -x "$repo_root/cxa" ]]; then
+if [[ ! -f "$repo_root/Cargo.toml" && -x "$repo_root/cxa" ]]; then
   cxa_binary="$repo_root/cxa"
 else
   command -v cargo >/dev/null 2>&1 || {

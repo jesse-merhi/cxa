@@ -8,7 +8,8 @@ use std::time::{Duration, Instant};
 use serde_json::{Value, json};
 use tempfile::Builder;
 
-use crate::account_store::{UsageRecord, UsageWindow, now_epoch};
+use crate::account_store::{UsageBucket, UsageRecord, UsageWindow, now_epoch};
+use crate::auth::AuthDocument;
 use crate::config::Config;
 use crate::fs::{atomic_copy, private_dir};
 use crate::{Error, Result};
@@ -16,19 +17,47 @@ use crate::{Error, Result};
 const MAX_MESSAGE_SIZE: usize = 4 * 1024 * 1024;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
 
-pub fn query_profile(config: &Config, source_auth: &Path) -> UsageRecord {
+pub fn query_profile(config: &Config, source_auth: &Path) -> (UsageRecord, bool) {
     match query_profile_inner(config, source_auth) {
-        Ok(usage) => usage,
-        Err(error) => UsageRecord {
-            observed_at: now_epoch(),
-            error: Some(format!("quota unavailable ({})", error_kind(&error))),
-            ..UsageRecord::default()
-        },
+        Ok((usage, session_changed)) => (usage.unwrap_or_else(unavailable_usage), session_changed),
+        Err(error) => (unavailable_usage(error), false),
     }
 }
 
-fn query_profile_inner(config: &Config, source_auth: &Path) -> Result<UsageRecord> {
+fn unavailable_usage(error: Error) -> UsageRecord {
+    let attempted_at = now_epoch();
+    UsageRecord {
+        observed_at: attempted_at,
+        last_attempted_at: attempted_at,
+        error: Some(format!("quota unavailable ({})", error_kind(&error))),
+        ..UsageRecord::default()
+    }
+}
+
+pub fn require_file_credentials(config: &Config) -> Result<()> {
+    config.require_no_credential_override()?;
+    let mut client = SpawnedClient::start(
+        config.codex_binary(),
+        &config.codex_home,
+        CredentialStore::Effective,
+    )?;
+    let checked = effective_credential_store(&mut client).and_then(|mode| {
+        if mode == "file" {
+            Ok(())
+        } else {
+            Err(Error::Message(format!(
+                "cxa requires Codex's file credential store, but Codex is configured to use `{mode}`. Set `cli_auth_credentials_store = \"file\"`, run `codex login` again, then run cxa."
+            )))
+        }
+    });
+    let stopped = client.finish();
+    checked?;
+    stopped
+}
+
+fn query_profile_inner(config: &Config, source_auth: &Path) -> Result<(Result<UsageRecord>, bool)> {
     private_dir(&config.account_store)?;
+    let original_auth = AuthDocument::read(source_auth)?;
     let home = Builder::new()
         .prefix(".quota-")
         .tempdir_in(&config.account_store)
@@ -39,13 +68,24 @@ fn query_profile_inner(config: &Config, source_auth: &Path) -> Result<UsageRecor
         atomic_copy(&source_config, &home.path().join("config.toml"), 0o600)?;
     }
 
-    let mut client = SpawnedClient::start(config.codex_binary(), home.path())?;
+    let mut client = SpawnedClient::start(
+        config.codex_binary(),
+        home.path(),
+        CredentialStore::ForceFile,
+    )?;
     let usage = query(&mut client);
-    let stopped = client.finish();
-    match (usage, stopped) {
-        (Ok(usage), Ok(())) => Ok(usage),
-        (Err(error), _) | (Ok(_), Err(error)) => Err(error),
+    client.finish()?;
+    let refreshed_auth = AuthDocument::read(home.path().join("auth.json"))?;
+    refreshed_auth.copy_to_same_account(source_auth)?;
+    let mut session_changed = false;
+    if let Ok(session) = AuthDocument::read(&config.session_auth) {
+        if refreshed_auth.identity.same_account(&session.identity)
+            && session.same_credentials(&original_auth)
+        {
+            session_changed = refreshed_auth.copy_to_same_account(&config.session_auth)?;
+        }
     }
+    Ok((usage, session_changed))
 }
 
 fn error_kind(error: &Error) -> &'static str {
@@ -82,6 +122,25 @@ trait RpcClient {
 }
 
 fn query(client: &mut impl RpcClient) -> Result<UsageRecord> {
+    initialize(client)?;
+    client.request(1, "account/read", Some(json!({"refreshToken": false})))?;
+    let result = client.request(2, "account/rateLimits/read", None)?;
+    parse_usage(&result)
+}
+
+fn effective_credential_store(client: &mut impl RpcClient) -> Result<String> {
+    initialize(client)?;
+    let result = client.request(1, "config/read", Some(json!({"includeLayers": false})))?;
+    result
+        .pointer("/config/cli_auth_credentials_store")
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned)
+        .ok_or_else(|| {
+            Error::Protocol("config/read returned no effective cli_auth_credentials_store".into())
+        })
+}
+
+fn initialize(client: &mut impl RpcClient) -> Result<()> {
     client.request(
         0,
         "initialize",
@@ -90,16 +149,39 @@ fn query(client: &mut impl RpcClient) -> Result<UsageRecord> {
         }})),
     )?;
     client.send(json!({"method": "initialized"}))?;
-    client.request(1, "account/read", Some(json!({"refreshToken": false})))?;
-    let result = client.request(2, "account/rateLimits/read", None)?;
-    parse_usage(&result)
+    Ok(())
 }
 
 fn parse_usage(result: &Value) -> Result<UsageRecord> {
-    let limits = result
-        .get("rateLimits")
+    let mut buckets = if let Some(limits) = result
+        .get("rateLimitsByLimitId")
         .and_then(Value::as_object)
-        .ok_or_else(|| Error::Protocol("account/rateLimits/read returned no limits".into()))?;
+        .filter(|limits| !limits.is_empty())
+    {
+        limits
+            .iter()
+            .filter_map(|(limit_id, value)| {
+                value.as_object().map(|value| parse_bucket(limit_id, value))
+            })
+            .collect()
+    } else {
+        let limits = result
+            .get("rateLimits")
+            .and_then(Value::as_object)
+            .ok_or_else(|| Error::Protocol("account/rateLimits/read returned no limits".into()))?;
+        vec![parse_bucket("codex", limits)]
+    };
+    buckets.sort_by(|left, right| left.limit_id.cmp(&right.limit_id));
+    let observed_at = now_epoch();
+    Ok(UsageRecord {
+        observed_at,
+        last_attempted_at: observed_at,
+        buckets,
+        error: None,
+    })
+}
+
+fn parse_bucket(limit_id: &str, limits: &serde_json::Map<String, Value>) -> UsageBucket {
     let window = |name: &str| {
         limits
             .get(name)
@@ -110,7 +192,6 @@ fn parse_usage(result: &Value) -> Result<UsageRecord> {
                 window_minutes: value.get("windowDurationMins").and_then(Value::as_i64),
             })
     };
-    let credits = limits.get("credits").and_then(Value::as_object);
     let reached_type = limits
         .get("rateLimitReachedType")
         .and_then(Value::as_str)
@@ -131,27 +212,27 @@ fn parse_usage(result: &Value) -> Result<UsageRecord> {
             resets_at: value.get("resetsAt").and_then(Value::as_i64),
             window_minutes: value.get("windowDurationMins").and_then(Value::as_i64),
         });
-    Ok(UsageRecord {
-        observed_at: now_epoch(),
+    UsageBucket {
+        limit_id: limits
+            .get("limitId")
+            .and_then(Value::as_str)
+            .unwrap_or(limit_id)
+            .to_owned(),
+        limit_name: limits
+            .get("limitName")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned),
         primary_window: window("primary"),
         secondary_window: window("secondary"),
         individual_window,
         reached: reached_type.is_some() || spend_control_reached,
         reached_type,
         spend_control_reached,
-        has_credits: credits
-            .and_then(|value| value.get("hasCredits"))
-            .and_then(Value::as_bool),
-        unlimited: credits
-            .and_then(|value| value.get("unlimited"))
-            .and_then(Value::as_bool),
-        balance: credits.and_then(|value| value.get("balance")).cloned(),
         plan_type: limits
             .get("planType")
             .and_then(Value::as_str)
             .map(ToOwned::to_owned),
-        error: None,
-    })
+    }
 }
 
 struct SpawnedClient {
@@ -160,11 +241,19 @@ struct SpawnedClient {
     messages: Receiver<std::result::Result<Value, String>>,
 }
 
+enum CredentialStore {
+    Effective,
+    ForceFile,
+}
+
 impl SpawnedClient {
-    fn start(codex_binary: &Path, home: &Path) -> Result<Self> {
+    fn start(codex_binary: &Path, home: &Path, credential_store: CredentialStore) -> Result<Self> {
         let mut command = Command::new(codex_binary);
+        if matches!(credential_store, CredentialStore::ForceFile) {
+            command.args(["-c", "cli_auth_credentials_store=\"file\""]);
+        }
         command
-            .args(["-c", "cli_auth_credentials_store=\"file\"", "app-server"])
+            .arg("app-server")
             .env("CODEX_HOME", home)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -302,12 +391,42 @@ mod tests {
         let usage = parse_usage(&json!({
             "rateLimits": {
                 "primary": {"usedPercent": 25.0, "resetsAt": 1234},
-                "credits": {"hasCredits": true, "unlimited": false}
+                "credits": {"hasCredits": false, "unlimited": false}
             }
         }))
         .unwrap();
 
-        assert_eq!(usage.primary_window.unwrap().used_percent, Some(25.0));
-        assert_eq!(usage.has_credits, Some(true));
+        let bucket = &usage.buckets[0];
+        assert_eq!(
+            bucket.primary_window.as_ref().unwrap().used_percent,
+            Some(25.0)
+        );
+        assert_eq!(
+            bucket.primary_window.as_ref().unwrap().resets_at,
+            Some(1234)
+        );
+        assert!(!usage.exhausted_now(now_epoch()));
+        assert!(!usage.label(now_epoch()).contains("no credits"));
+    }
+
+    #[test]
+    fn parses_every_named_quota_bucket() {
+        let usage = parse_usage(&json!({
+            "rateLimits": {"primary": {"usedPercent": 1.0}},
+            "rateLimitsByLimitId": {
+                "codex": {"limitId": "codex", "primary": {"usedPercent": 25.0}},
+                "codex_other": {
+                    "limitId": "codex_other",
+                    "limitName": "Other models",
+                    "primary": {"usedPercent": 100.0}
+                }
+            }
+        }))
+        .unwrap();
+
+        assert_eq!(usage.buckets.len(), 2);
+        assert_eq!(usage.buckets[1].limit_name.as_deref(), Some("Other models"));
+        assert!(usage.exhausted_now(now_epoch()));
+        assert!(usage.label(now_epoch()).contains("Other models EXHAUSTED"));
     }
 }
