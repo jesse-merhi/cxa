@@ -28,8 +28,8 @@ assert_contract(
 linux_build = jobs.fetch("build-linux")
 assert_contract(linux_build["runs-on"] == "ubuntu-22.04", "Linux archives must target Ubuntu 22.04")
 assert_contract(
-  scripts(linux_build).include?('cargo build --locked --release --target "$TARGET" --bins'),
-  "Linux release must build every binary"
+  scripts(linux_build).include?('cargo build --locked --release --target "$TARGET" --bin cxa'),
+  "Linux release must build cxa"
 )
 
 linux_validation = jobs.fetch("validate-linux")

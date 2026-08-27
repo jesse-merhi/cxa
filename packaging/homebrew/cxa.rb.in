@@ -1,5 +1,5 @@
 class Cxa < Formula
-  desc "Fast, crash-safe account switcher for Codex ChatGPT OAuth accounts"
+  desc "Fast account switcher for Codex ChatGPT OAuth accounts"
   homepage "https://github.com/jesse-merhi/cxa"
   license "MIT"
 

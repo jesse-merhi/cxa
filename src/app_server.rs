@@ -1,100 +1,50 @@
-use std::fs;
 use std::io::{Read, Write};
-use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::mpsc::{self, Receiver};
 use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 use tempfile::Builder;
-use tungstenite::client::{IntoClientRequest, client_with_config};
-use tungstenite::handshake::HandshakeError;
-use tungstenite::protocol::WebSocketConfig;
-use tungstenite::{Message, WebSocket};
 
 use crate::account_store::{UsageRecord, UsageWindow, now_epoch};
 use crate::config::Config;
-use crate::fs::{
-    DeadlineUnixStream, ExclusiveLock, OWNED_TEMP_MARKER, STAGING_WRITER_LOCK, atomic_copy,
-    atomic_write, private_dir,
-};
+use crate::fs::{atomic_copy, private_dir};
 use crate::{Error, Result};
 
 const MAX_MESSAGE_SIZE: usize = 4 * 1024 * 1024;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
-const FRAME_TIMEOUT: Duration = Duration::from_secs(5);
 
-pub struct QuotaResult {
-    pub usage: UsageRecord,
-    pub refreshed_auth: Option<Vec<u8>>,
-}
-
-pub fn query_shared(socket_path: &Path) -> QuotaResult {
-    match SocketClient::connect(socket_path).and_then(|mut client| query(&mut client, true)) {
-        Ok(usage) => QuotaResult {
-            usage,
-            refreshed_auth: None,
-        },
-        Err(error) => QuotaResult {
-            usage: unavailable(&error),
-            refreshed_auth: None,
+pub fn query_profile(config: &Config, source_auth: &Path) -> UsageRecord {
+    match query_profile_inner(config, source_auth) {
+        Ok(usage) => usage,
+        Err(error) => UsageRecord {
+            observed_at: now_epoch(),
+            error: Some(format!("quota unavailable ({})", error_kind(&error))),
+            ..UsageRecord::default()
         },
     }
 }
 
-pub fn prepare_offline_home(config: &Config, source_auth: &Path) -> Result<tempfile::TempDir> {
+fn query_profile_inner(config: &Config, source_auth: &Path) -> Result<UsageRecord> {
     private_dir(&config.account_store)?;
     let home = Builder::new()
         .prefix(".quota-")
         .tempdir_in(&config.account_store)
         .map_err(|error| Error::io(&config.account_store, error))?;
-    atomic_write(&home.path().join(OWNED_TEMP_MARKER), b"cxa\n", 0o600)?;
     atomic_copy(source_auth, &home.path().join("auth.json"), 0o600)?;
     let source_config = config.codex_home.join("config.toml");
     if source_config.is_file() {
         atomic_copy(&source_config, &home.path().join("config.toml"), 0o600)?;
     }
-    Ok(home)
-}
 
-pub fn query_offline(config: &Config, home: &Path) -> QuotaResult {
-    query_spawned(config.codex_binary(), home, true)
-}
-
-pub fn query_offline_read_only(config: &Config, home: &Path) -> QuotaResult {
-    query_spawned(config.codex_binary(), home, false)
-}
-
-fn query_spawned(codex_binary: &Path, home: &Path, refresh_token: bool) -> QuotaResult {
-    let mut client = match SpawnedClient::start(codex_binary, home) {
-        Ok(client) => client,
-        Err(error) => {
-            return QuotaResult {
-                usage: unavailable(&error),
-                refreshed_auth: None,
-            };
-        }
-    };
-    let usage = query(&mut client, refresh_token);
-    let refreshed = client.finish();
-    let refreshed_auth = refreshed.as_ref().ok().cloned().flatten();
-    let usage = match (usage, refreshed) {
-        (Ok(usage), Ok(_)) => usage,
-        (Err(error), _) | (Ok(_), Err(error)) => unavailable(&error),
-    };
-    QuotaResult {
-        usage,
-        refreshed_auth,
-    }
-}
-
-fn unavailable(error: &Error) -> UsageRecord {
-    UsageRecord {
-        observed_at: now_epoch(),
-        error: Some(format!("quota unavailable ({})", error_kind(error))),
-        ..UsageRecord::default()
+    let mut client = SpawnedClient::start(config.codex_binary(), home.path())?;
+    let usage = query(&mut client);
+    let stopped = client.finish();
+    match (usage, stopped) {
+        (Ok(usage), Ok(())) => Ok(usage),
+        (Err(error), _) | (Ok(_), Err(error)) => Err(error),
     }
 }
 
@@ -102,7 +52,6 @@ fn error_kind(error: &Error) -> &'static str {
     match error {
         Error::Timeout => "Timeout",
         Error::Protocol(_) => "Protocol",
-        Error::WebSocket(_) => "WebSocket",
         Error::Io { .. } => "Io",
         _ => "Error",
     }
@@ -132,7 +81,7 @@ trait RpcClient {
     }
 }
 
-fn query(client: &mut impl RpcClient, refresh_token: bool) -> Result<UsageRecord> {
+fn query(client: &mut impl RpcClient) -> Result<UsageRecord> {
     client.request(
         0,
         "initialize",
@@ -141,11 +90,7 @@ fn query(client: &mut impl RpcClient, refresh_token: bool) -> Result<UsageRecord
         }})),
     )?;
     client.send(json!({"method": "initialized"}))?;
-    client.request(
-        1,
-        "account/read",
-        Some(json!({"refreshToken": refresh_token})),
-    )?;
+    client.request(1, "account/read", Some(json!({"refreshToken": false})))?;
     let result = client.request(2, "account/rateLimits/read", None)?;
     parse_usage(&result)
 }
@@ -177,22 +122,14 @@ fn parse_usage(result: &Value) -> Result<UsageRecord> {
     let individual_window = limits
         .get("individualLimit")
         .and_then(Value::as_object)
-        .map(|value| {
-            let used_percent = value
+        .map(|value| UsageWindow {
+            used_percent: value
                 .get("remainingPercent")
                 .and_then(Value::as_f64)
                 .map(|remaining| (100.0 - remaining).clamp(0.0, 100.0))
-                .or_else(|| {
-                    let used = value.get("used").and_then(Value::as_f64)?;
-                    let limit = value.get("limit").and_then(Value::as_f64)?;
-                    (limit > 0.0).then_some((used / limit * 100.0).clamp(0.0, 100.0))
-                })
-                .or_else(|| value.get("usedPercent").and_then(Value::as_f64));
-            UsageWindow {
-                used_percent,
-                resets_at: value.get("resetsAt").and_then(Value::as_i64),
-                window_minutes: value.get("windowDurationMins").and_then(Value::as_i64),
-            }
+                .or_else(|| value.get("usedPercent").and_then(Value::as_f64)),
+            resets_at: value.get("resetsAt").and_then(Value::as_i64),
+            window_minutes: value.get("windowDurationMins").and_then(Value::as_i64),
         });
     Ok(UsageRecord {
         observed_at: now_epoch(),
@@ -217,90 +154,14 @@ fn parse_usage(result: &Value) -> Result<UsageRecord> {
     })
 }
 
-struct SocketClient {
-    websocket: WebSocket<DeadlineUnixStream>,
-}
-
-impl SocketClient {
-    fn connect(path: &Path) -> Result<Self> {
-        let stream = UnixStream::connect(path).map_err(|error| Error::io(path, error))?;
-        let stream = DeadlineUnixStream::new(stream, Instant::now() + FRAME_TIMEOUT);
-        let request = "ws://localhost/rpc"
-            .into_client_request()
-            .map_err(|error| Error::Protocol(error.to_string()))?;
-        let websocket_config = WebSocketConfig::default()
-            .max_message_size(Some(MAX_MESSAGE_SIZE))
-            .max_frame_size(Some(MAX_MESSAGE_SIZE));
-        let (mut websocket, _) =
-            client_with_config(request, stream, Some(websocket_config)).map_err(handshake_error)?;
-        websocket.get_mut().clear_deadline();
-        websocket
-            .get_mut()
-            .set_read_timeout(Some(FRAME_TIMEOUT))
-            .map_err(|error| Error::io(path, error))?;
-        websocket
-            .get_mut()
-            .set_write_timeout(Some(FRAME_TIMEOUT))
-            .map_err(|error| Error::io(path, error))?;
-        Ok(Self { websocket })
-    }
-}
-
-fn handshake_error<Role: tungstenite::handshake::HandshakeRole>(
-    error: HandshakeError<Role>,
-) -> Error {
-    match error {
-        HandshakeError::Failure(error) => Error::WebSocket(error),
-        HandshakeError::Interrupted(_) => {
-            Error::Protocol("blocking WebSocket handshake was interrupted".into())
-        }
-    }
-}
-
-impl RpcClient for SocketClient {
-    fn send(&mut self, message: Value) -> Result<()> {
-        self.websocket
-            .send(Message::Text(message.to_string().into()))?;
-        Ok(())
-    }
-
-    fn receive(&mut self, deadline: Instant) -> Result<Value> {
-        loop {
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
-                return Err(Error::Timeout);
-            }
-            self.websocket
-                .get_mut()
-                .set_read_timeout(Some(remaining))
-                .map_err(|error| Error::io("shared app-server socket", error))?;
-            match self.websocket.read()? {
-                Message::Text(text) => {
-                    return serde_json::from_str(&text)
-                        .map_err(|error| Error::Protocol(error.to_string()));
-                }
-                Message::Ping(payload) => self.websocket.send(Message::Pong(payload))?,
-                Message::Close(_) => {
-                    return Err(Error::Protocol("app server closed the WebSocket".into()));
-                }
-                _ => {}
-            }
-        }
-    }
-}
-
 struct SpawnedClient {
     child: ChildGuard,
-    _writer_lock: ExclusiveLock,
     stdin: ChildStdin,
     messages: Receiver<std::result::Result<Value, String>>,
-    auth_path: PathBuf,
 }
 
 impl SpawnedClient {
     fn start(codex_binary: &Path, home: &Path) -> Result<Self> {
-        let auth_path = home.join("auth.json");
-        let writer_lock = ExclusiveLock::acquire_inheritable(&home.join(STAGING_WRITER_LOCK))?;
         let mut command = Command::new(codex_binary);
         command
             .args(["-c", "cli_auth_credentials_store=\"file\"", "app-server"])
@@ -329,20 +190,13 @@ impl SpawnedClient {
         std::thread::spawn(move || read_json_lines(stdout, sender));
         Ok(Self {
             child: ChildGuard(Some(child)),
-            _writer_lock: writer_lock,
             stdin,
             messages,
-            auth_path,
         })
     }
 
-    fn finish(&mut self) -> Result<Option<Vec<u8>>> {
-        self.child.stop()?;
-        match fs::read(&self.auth_path) {
-            Ok(bytes) => Ok(Some(bytes)),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(error) => Err(Error::io(&self.auth_path, error)),
-        }
+    fn finish(&mut self) -> Result<()> {
+        self.child.stop()
     }
 }
 
@@ -358,9 +212,8 @@ impl RpcClient for SpawnedClient {
     }
 
     fn receive(&mut self, deadline: Instant) -> Result<Value> {
-        let remaining = deadline.saturating_duration_since(Instant::now());
         self.messages
-            .recv_timeout(remaining)
+            .recv_timeout(deadline.saturating_duration_since(Instant::now()))
             .map_err(|_| Error::Timeout)?
             .map_err(Error::Protocol)
     }
@@ -443,89 +296,18 @@ impl Drop for ChildGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::os::unix::net::UnixListener;
-    use tempfile::tempdir;
-
-    #[allow(clippy::result_large_err)]
-    fn select_codex_subprotocol(
-        _: &tungstenite::handshake::server::Request,
-        response: tungstenite::handshake::server::Response,
-    ) -> std::result::Result<
-        tungstenite::handshake::server::Response,
-        tungstenite::handshake::server::ErrorResponse,
-    > {
-        Ok(response)
-    }
 
     #[test]
-    fn parses_all_quota_windows_and_exhaustion() {
-        let record = parse_usage(&json!({"rateLimits": {
-            "primary": {"usedPercent": 25, "resetsAt": 4_102_444_800_i64},
-            "secondary": {"usedPercent": 75, "resetsAt": 4_102_448_400_i64},
-            "individualLimit": {"remainingPercent": 25, "used": 75, "limit": 100, "resetsAt": 4_102_452_000_i64},
-            "credits": {"hasCredits": false, "unlimited": false, "balance": "0"},
-            "planType": "team",
-            "rateLimitReachedType": "workspace_member_usage_limit_reached",
-            "spendControlReached": true
-        }}))
+    fn parses_quota_windows() {
+        let usage = parse_usage(&json!({
+            "rateLimits": {
+                "primary": {"usedPercent": 25.0, "resetsAt": 1234},
+                "credits": {"hasCredits": true, "unlimited": false}
+            }
+        }))
         .unwrap();
-        assert_eq!(record.primary_window.unwrap().used_percent, Some(25.0));
-        assert_eq!(record.secondary_window.unwrap().used_percent, Some(75.0));
-        assert_eq!(record.individual_window.unwrap().used_percent, Some(75.0));
-        assert!(record.reached);
-        assert!(record.spend_control_reached);
-    }
 
-    #[test]
-    fn queries_quota_over_the_shared_websocket() {
-        let directory = tempdir().unwrap();
-        let socket = directory.path().join("app-server.sock");
-        let listener = UnixListener::bind(&socket).unwrap();
-        let server = std::thread::spawn(move || {
-            let (stream, _) = listener.accept().unwrap();
-            let mut websocket = tungstenite::accept_hdr(stream, select_codex_subprotocol).unwrap();
-            let initialize: Value =
-                serde_json::from_str(&websocket.read().unwrap().into_text().unwrap()).unwrap();
-            assert_eq!(initialize["method"], "initialize");
-            websocket
-                .send(Message::Text(
-                    json!({"id":0,"result":{"serverInfo":{"name":"fake"}}})
-                        .to_string()
-                        .into(),
-                ))
-                .unwrap();
-            let initialized: Value =
-                serde_json::from_str(&websocket.read().unwrap().into_text().unwrap()).unwrap();
-            assert_eq!(initialized["method"], "initialized");
-            let account: Value =
-                serde_json::from_str(&websocket.read().unwrap().into_text().unwrap()).unwrap();
-            assert_eq!(account["method"], "account/read");
-            assert_eq!(account["params"]["refreshToken"], true);
-            websocket
-                .send(Message::Text(
-                    json!({"id":1,"result":{"account":{"type":"chatgpt"}}})
-                        .to_string()
-                        .into(),
-                ))
-                .unwrap();
-            let quota: Value =
-                serde_json::from_str(&websocket.read().unwrap().into_text().unwrap()).unwrap();
-            assert_eq!(quota["method"], "account/rateLimits/read");
-            websocket
-                .send(Message::Text(
-                    json!({"id":2,"result":{"rateLimits":{"primary":{"usedPercent":31}}}})
-                        .to_string()
-                        .into(),
-                ))
-                .unwrap();
-        });
-
-        let result = query_shared(&socket);
-        assert!(result.usage.succeeded(), "{:?}", result.usage.error);
-        assert_eq!(
-            result.usage.primary_window.unwrap().used_percent,
-            Some(31.0)
-        );
-        server.join().unwrap();
+        assert_eq!(usage.primary_window.unwrap().used_percent, Some(25.0));
+        assert_eq!(usage.has_credits, Some(true));
     }
 }

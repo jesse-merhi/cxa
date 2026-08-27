@@ -18,18 +18,10 @@ pub enum Error {
     },
     #[error("invalid credentials at {0}")]
     InvalidAuth(PathBuf),
-    #[error("Codex is running and may still write the current credentials")]
-    WriterRunning,
-    #[error("credential transaction recovery is waiting for Codex to exit")]
-    RecoveryDeferred,
     #[error("app-server protocol error: {0}")]
     Protocol(String),
     #[error("app-server request timed out")]
     Timeout,
-    #[error(transparent)]
-    Nix(#[from] nix::Error),
-    #[error(transparent)]
-    WebSocket(#[from] tungstenite::Error),
 }
 
 impl Error {

@@ -58,7 +58,7 @@ jobs:
           TARGET: ${{ matrix.target }}
         run: |
           rustup target add "$TARGET"
-          cargo build --locked --release --target "$TARGET" --bins
+          cargo build --locked --release --target "$TARGET" --bin cxa
       - name: Package archive
         env:
           ASSET: ${{ matrix.asset }}
@@ -66,9 +66,6 @@ jobs:
         run: |
           mkdir -p "dist/$ASSET"
           install -m 0755 "target/$TARGET/release/cxa" "dist/$ASSET/cxa"
-          install -m 0755 "target/$TARGET/release/codex-quota-proxy" "dist/$ASSET/codex-quota-proxy"
-          install -m 0755 "target/$TARGET/release/codex-shared-socket" "dist/$ASSET/codex-shared-socket"
-          cp -R systemd "dist/$ASSET/systemd"
           cp README.md LICENSE install.sh "dist/$ASSET/"
           tar -C dist -czf "dist/$ASSET.tar.gz" "$ASSET"
       - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
@@ -101,12 +98,10 @@ jobs:
         run: |
           tar -C dist -xzf "dist/$ASSET.tar.gz"
           "dist/$ASSET/cxa" --version
-          for binary in cxa codex-quota-proxy codex-shared-socket; do
-            if ldd "dist/$ASSET/$binary" | grep -Fq 'not found'; then
-              echo "$binary has unresolved shared libraries"
-              exit 1
-            fi
-          done
+          if ldd "dist/$ASSET/cxa" | grep -Fq 'not found'; then
+            echo "cxa has unresolved shared libraries"
+            exit 1
+          fi
 
   build-macos:
     needs: verify
