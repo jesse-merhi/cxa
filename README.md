@@ -1,119 +1,164 @@
 # cxa
 
-`cxa` is a fast account switcher for Codex ChatGPT OAuth accounts. It stores
-multiple logins, copies the selected account into the normal Codex home, and
-records quota for each account.
+[![CI](https://github.com/jesse-merhi/cxa/actions/workflows/ci.yml/badge.svg)](https://github.com/jesse-merhi/cxa/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/jesse-merhi/cxa)](https://github.com/jesse-merhi/cxa/releases/latest)
+[![License](https://img.shields.io/github/license/jesse-merhi/cxa)](LICENSE)
+
+`cxa` is a fast CLI for switching between multiple ChatGPT accounts in Codex
+and viewing each account's quota.
+
+It uses Codex's normal credential file, so you can keep launching Codex exactly
+as you do today.
+
+## Requirements
+
+- The [Codex CLI](https://developers.openai.com/codex/cli) installed and
+  available as `codex`
+- A ChatGPT OAuth login; API-key authentication is not supported
+- macOS or Linux
 
 ## Install
 
-After the first stable release is published, install with Homebrew:
+### Homebrew
 
 ```sh
 brew install jesse-merhi/tap/cxa
 ```
 
-Install from source:
+### From source
+
+Requires Rust 1.85 or newer.
 
 ```sh
 cargo install --locked --git https://github.com/jesse-merhi/cxa --bin cxa
 ```
 
-Or clone the repository and install into `~/.local/bin`:
+Prebuilt binaries for Intel and Apple silicon Macs, plus x86-64 and ARM64 Linux,
+are available from
+[GitHub Releases](https://github.com/jesse-merhi/cxa/releases/latest). Linux
+binaries require glibc 2.35 or newer. Windows is not currently supported.
 
-```sh
-git clone https://github.com/jesse-merhi/cxa.git
-cd cxa
-./install.sh
-```
+## Quick start
 
-Then import the Codex account that is already signed in:
-
-```sh
-cxa init
-```
-
-The source installer writes to `~/.local/bin`. If that directory is not on your
-`PATH`, run `~/.local/bin/cxa init` once or add the directory to `PATH`.
-Homebrew handles `PATH` for you.
-
-Use `cxa init --yes` when input or output is redirected.
-
-Tagged releases contain native archives for Linux x86-64/ARM64 and macOS
-x86-64/Apple silicon, plus a `SHA256SUMS` file. Extract the archive for your
-platform and run `./install.sh` to install the bundled binary without Rust.
-Linux archives target glibc 2.35 (Ubuntu 22.04 or newer). Windows is not
-currently supported.
-
-## Use
-
-Initialize from the current Codex login, enroll another account, and switch:
+Import the account already signed in to Codex:
 
 ```sh
 cxa init
+```
+
+Add another account. `cxa` will open the normal Codex login flow:
+
+```sh
 cxa add
-cxa 2
 ```
 
-Common commands:
+List your accounts and their latest known quota:
 
 ```sh
 cxa list
-cxa status
-cxa use 2
-cxa import /path/to/auth.json
-cxa relogin 2
 ```
 
-`cxa` can switch accounts while Codex or ChatGPT is running. It directly
-replaces `$CODEX_HOME/auth.json`; restart Codex or ChatGPT before expecting an
-existing session to use the newly selected account.
+Switch accounts by number or by a unique part of the email address:
 
-Quota reads run through a separate `codex app-server` process in an isolated
-temporary home for each saved profile. They do not switch the active account or
-force an OAuth refresh. If Codex proactively refreshes a near-expiry token while
-reading quota, cxa validates and saves the newer credentials back to that
-profile. If a saved refresh token is already invalid, run `cxa relogin
-<account>`.
+```sh
+cxa 2
+cxa use work@example.com
+```
 
-Profiles live under `~/.codex-auth/profile-N`. The selected account is inferred
-from the credentials currently stored at `$CODEX_HOME/auth.json`. The following
-absolute-path overrides are supported:
+Restart any running Codex or ChatGPT session after switching so it loads the
+new account.
 
-- `CODEX_HOME`
-- `CXA_ACCOUNT_STORE`
-- `CXA_CODEX_BIN`
-- `CXA_USAGE_TTL`
-- `CXA_SKIP_USAGE_REFRESH=1`
+## Example
 
-cxa supports Codex's default file-backed credential store. If you have set
-`cli_auth_credentials_store` to `keyring`, `auto`, or `ephemeral`, change it to
-`file` and run `codex login` again before using cxa.
+```text
+$ cxa list
+* 1  personal@example.com  primary 18% used, secondary 41% used, seen just now
+  2  work@example.com  primary 63% used, secondary 9% used, seen just now
 
-## Credential model
+$ cxa 2
+✓ Account 2 (work@example.com) is now selected.
+! Restart Codex or ChatGPT before expecting an existing session to use this account.
+```
 
-Selecting an account atomically copies its saved profile to
-`$CODEX_HOME/auth.json`. cxa infers the selection from that file, serializes its
-own writes with a local lock, and does not coordinate with running Codex or
-ChatGPT processes.
+The `*` marks the account currently selected in Codex.
 
-Account identity includes the ChatGPT user ID and, when present, the workspace
-account ID, not only the email address. This keeps different workspaces with the
-same email distinct.
+## Commands
+
+| Command | Description |
+| --- | --- |
+| `cxa` | Show the selected account and credential state |
+| `cxa init` | Import the current Codex login as account 1 |
+| `cxa add` | Sign in and add another account |
+| `cxa list` | List accounts and their latest known quota |
+| `cxa <account>` | Switch by account number or email |
+| `cxa use <account>` | Switch using the explicit command form |
+| `cxa status` | Show the selected account and credential state |
+| `cxa relogin <account>` | Re-authenticate a saved account |
+| `cxa import <auth.json>` | Import an existing Codex credential file |
+
+Use `cxa --help` or `cxa <command> --help` for the complete CLI reference.
+
+## How it works
+
+Each account is stored as a profile under `~/.codex-auth`. When you switch,
+`cxa` atomically copies that profile to `$CODEX_HOME/auth.json`, which is the
+standard file-backed credential store used by Codex.
+
+Codex keeps credentials in memory while it is running. Switching is safe, but
+an existing Codex or ChatGPT process will continue using its previous account
+until you restart it.
+
+To read quota, `cxa` runs `codex app-server` with the saved account in an
+isolated temporary home. This does not change the selected account. Codex owns
+OAuth token refresh; if it refreshes a token during a quota read, `cxa` verifies
+the account identity before saving the updated credentials.
+
+Account identity includes the ChatGPT user ID and, when available, the
+workspace ID. Accounts and workspaces that share an email address remain
+distinct.
+
+## Credential storage
+
+`cxa` supports Codex's default file-backed credential store. If you configured
+`cli_auth_credentials_store` as `keyring`, `auto`, or `ephemeral`, change it to
+`file` and run `codex login` again before using `cxa`:
+
+```toml
+# ~/.codex/config.toml
+cli_auth_credentials_store = "file"
+```
+
+If an account's refresh token is no longer valid, re-authenticate it:
+
+```sh
+cxa relogin <account>
+```
+
+## Configuration
+
+| Variable | Purpose |
+| --- | --- |
+| `CODEX_HOME` | Override the Codex home directory |
+| `CXA_ACCOUNT_STORE` | Override the account profile directory |
+| `CXA_CODEX_BIN` | Override the Codex executable used for login and quota reads |
+| `CXA_USAGE_TTL` | Set the quota cache lifetime in seconds (default: `120`) |
+| `CXA_SKIP_USAGE_REFRESH=1` | Show cached quota without refreshing it |
+
+Values supplied to path variables must be absolute.
+
+For non-interactive setup, use `cxa init --yes`.
 
 ## Development
-
-The project requires Rust 1.85 or newer.
 
 ```sh
 ./scripts/check.sh
 cargo build --locked --release --bin cxa
 ```
 
-Pull requests run formatting, clippy with warnings denied, tests, and builds on
-Linux and macOS. A matching version tag publishes native release archives and
-updates `Formula/cxa.rb` in
+CI checks formatting, Clippy, tests, release packaging, and Linux and macOS
+builds. Version tags publish native archives and update
 [`jesse-merhi/homebrew-tap`](https://github.com/jesse-merhi/homebrew-tap).
 
 ## License
 
-MIT
+[MIT](LICENSE)
