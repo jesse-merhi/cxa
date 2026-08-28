@@ -1,0 +1,305 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cxa-release
+  queue: max
+
+jobs:
+  verify:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - run: rustup update stable --no-self-update
+      - run: rustup component add rustfmt clippy
+      - name: Verify tag matches Cargo version
+        run: |
+          version="$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | sed -n '1p')"
+          tag_version="${GITHUB_REF_NAME#v}"
+          if [[ "$tag_version" != "$version" ]]; then
+            printf 'Tag %s does not match Cargo version %s.\n' "$GITHUB_REF_NAME" "$version" >&2
+            exit 1
+          fi
+          if [[ "$tag_version" == *+* ]]; then
+            printf 'Build metadata is not supported in release versions: %s.\n' "$tag_version" >&2
+            exit 1
+          fi
+      - run: ./scripts/check.sh
+
+  build-linux:
+    needs: verify
+    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            asset: cxa-linux-x86_64
+            cross_package: ""
+          - target: aarch64-unknown-linux-gnu
+            asset: cxa-linux-aarch64
+            cross_package: gcc-aarch64-linux-gnu
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - run: rustup update stable --no-self-update
+      - name: Install cross compiler
+        if: ${{ matrix.cross_package != '' }}
+        env:
+          CROSS_PACKAGE: ${{ matrix.cross_package }}
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes "$CROSS_PACKAGE"
+      - name: Build release binaries against Ubuntu 22.04
+        env:
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+          TARGET: ${{ matrix.target }}
+        run: |
+          rustup target add "$TARGET"
+          cargo build --locked --release --target "$TARGET" --bin cxa
+      - name: Package archive
+        env:
+          ASSET: ${{ matrix.asset }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          mkdir -p "dist/$ASSET"
+          install -m 0755 "target/$TARGET/release/cxa" "dist/$ASSET/cxa"
+          cp README.md LICENSE install.sh "dist/$ASSET/"
+          tar -C dist -czf "dist/$ASSET.tar.gz" "$ASSET"
+      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: ${{ matrix.asset }}
+          path: dist/${{ matrix.asset }}.tar.gz
+          if-no-files-found: error
+
+  validate-linux:
+    needs: build-linux
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            asset: cxa-linux-x86_64
+          - runner: ubuntu-24.04-arm
+            asset: cxa-linux-aarch64
+    runs-on: ${{ matrix.runner }}
+    container:
+      image: ubuntu:22.04@sha256:2edbbc5dc405e9612ba3584ce95480277e3eb374407b5505fe26f17df77c7dbc
+    steps:
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        with:
+          name: ${{ matrix.asset }}
+          path: dist
+      - name: Run archive on the oldest supported Linux
+        env:
+          ASSET: ${{ matrix.asset }}
+        run: |
+          tar -C dist -xzf "dist/$ASSET.tar.gz"
+          "dist/$ASSET/cxa" --version
+          if ldd "dist/$ASSET/cxa" | grep -Fq 'not found'; then
+            echo "cxa has unresolved shared libraries"
+            exit 1
+          fi
+
+  build-macos:
+    needs: verify
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15-intel
+            target: x86_64-apple-darwin
+            asset: cxa-macos-x86_64
+          - runner: macos-15
+            target: aarch64-apple-darwin
+            asset: cxa-macos-aarch64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - run: rustup update stable --no-self-update
+      - name: Build release binaries
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          rustup target add "$TARGET"
+          cargo build --locked --release --target "$TARGET" --bin cxa
+      - name: Package archive
+        env:
+          ASSET: ${{ matrix.asset }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          mkdir -p "dist/$ASSET"
+          install -m 0755 "target/$TARGET/release/cxa" "dist/$ASSET/cxa"
+          cp README.md LICENSE install.sh "dist/$ASSET/"
+          tar -C dist -czf "dist/$ASSET.tar.gz" "$ASSET"
+      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: ${{ matrix.asset }}
+          path: dist/${{ matrix.asset }}.tar.gz
+          if-no-files-found: error
+
+  validate-macos:
+    needs: build-macos
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15-intel
+            asset: cxa-macos-x86_64
+          - runner: macos-15
+            asset: cxa-macos-aarch64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        with:
+          name: ${{ matrix.asset }}
+          path: dist
+      - name: Run and install from the archive
+        env:
+          ASSET: ${{ matrix.asset }}
+        run: |
+          archive_root="$(mktemp -d)"
+          tar -C "$archive_root" -xzf "dist/$ASSET.tar.gz"
+          "$archive_root/$ASSET/cxa" --version
+          HOME="$archive_root/home" "$archive_root/$ASSET/install.sh" --dry-run
+
+  publish:
+    needs:
+      - validate-linux
+      - validate-macos
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        with:
+          path: release
+          merge-multiple: true
+      - name: Create checksums
+        working-directory: release
+        run: sha256sum -- *.tar.gz > SHA256SUMS
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          release_args=(--verify-tag --generate-notes)
+          if [[ "$GITHUB_REF_NAME" == *-* ]]; then
+            release_args+=(--prerelease --latest=false)
+          fi
+          gh release create "$GITHUB_REF_NAME" release/* "${release_args[@]}"
+
+  homebrew-validate:
+    needs: publish
+    if: ${{ !contains(github.ref_name, '-') }}
+    strategy:
+      fail-fast: false
+      matrix:
+        runner:
+          - ubuntu-24.04
+          - macos-15
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        with:
+          path: release
+          merge-multiple: true
+      - name: Create checksums
+        working-directory: release
+        run: |
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum -- *.tar.gz > SHA256SUMS
+          else
+            shasum -a 256 -- *.tar.gz > SHA256SUMS
+          fi
+      - name: Check out Homebrew tap
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          repository: jesse-merhi/homebrew-tap
+          path: homebrew-tap
+          persist-credentials: false
+      - name: Set up Homebrew
+        uses: Homebrew/actions/setup-homebrew@8f3d1ec8a696b3b9d9a6c3696b6c73033cab69e4 # 2026.08.14.1
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Update formula
+        run: |
+          mkdir -p homebrew-tap/Formula
+          ./scripts/generate-homebrew-formula.sh \
+            "$GITHUB_REF_NAME" \
+            release/SHA256SUMS \
+            homebrew-tap/Formula/cxa.rb
+      - name: Validate formula
+        env:
+          HOMEBREW_NO_AUTO_UPDATE: "1"
+        run: |
+          brew tap jesse-merhi/tap
+          tap_formula="$(brew --repository jesse-merhi/tap)/Formula/cxa.rb"
+          audit_args=(--strict --online)
+          if [[ ! -f "$tap_formula" ]]; then
+            audit_args+=(--new)
+          fi
+          mkdir -p "$(dirname "$tap_formula")"
+          install -m 0644 homebrew-tap/Formula/cxa.rb "$tap_formula"
+          brew audit "${audit_args[@]}" jesse-merhi/tap/cxa
+          brew install jesse-merhi/tap/cxa
+          brew test jesse-merhi/tap/cxa
+
+  homebrew:
+    needs: homebrew-validate
+    if: ${{ !contains(github.ref_name, '-') }}
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        with:
+          path: release
+          merge-multiple: true
+      - name: Create checksums
+        working-directory: release
+        run: sha256sum -- *.tar.gz > SHA256SUMS
+      - name: Generate formula
+        run: |
+          ./scripts/generate-homebrew-formula.sh \
+            "$GITHUB_REF_NAME" \
+            release/SHA256SUMS \
+            generated-cxa.rb
+      - name: Check out Homebrew tap
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          repository: jesse-merhi/homebrew-tap
+          path: homebrew-tap
+          ssh-key: ${{ secrets.HOMEBREW_TAP_DEPLOY_KEY }}
+      - name: Publish formula
+        run: |
+          mkdir -p homebrew-tap/Formula
+          current_version=""
+          if [[ -f homebrew-tap/Formula/cxa.rb ]]; then
+            current_version="$(sed -n 's#.*releases/download/v\([^/]*\)/.*#\1#p' homebrew-tap/Formula/cxa.rb | sed -n '1p')"
+          fi
+          release_version="${GITHUB_REF_NAME#v}"
+          if [[ -n "$current_version" ]] && ! ruby -e '
+            require "rubygems/version"
+            exit Gem::Version.new(ARGV[0]) >= Gem::Version.new(ARGV[1]) ? 0 : 1
+          ' "$release_version" "$current_version"; then
+            echo "Refusing to replace cxa $current_version with older release $release_version."
+            exit 1
+          fi
+          install -m 0644 generated-cxa.rb homebrew-tap/Formula/cxa.rb
+          cd homebrew-tap
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Formula/cxa.rb
+          if git diff --cached --quiet; then
+            echo "Formula is already current."
+            exit 0
+          fi
+          git commit -m "cxa ${GITHUB_REF_NAME#v}"
+          git push origin HEAD:main
