@@ -2,18 +2,23 @@ use std::ffi::OsString;
 use std::io::{self, IsTerminal, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::mpsc::{self, RecvTimeoutError};
+use std::thread;
+use std::time::Duration;
 
 use anstream::{eprintln, print, println};
-use anstyle::Style;
 use clap::{Parser, Subcommand};
 use tempfile::Builder;
 
-use crate::account_store::{Store, UsageRecord, now_epoch};
+use crate::account_store::{Profile, Store, UsageRecord, now_epoch};
 use crate::app_server::{query_profile, require_file_credentials};
 use crate::auth::AuthDocument;
 use crate::config::Config;
 use crate::fs::{ExclusiveLock, atomic_copy, private_dir, remove_file_if_exists};
-use crate::terminal::{ACCENT, EMPHASIS, ERROR, MUTED, SUCCESS, WARNING};
+use crate::terminal::{
+    ACCENT, EMPHASIS, FetchSpinner, LiveRegion, MUTED, SUCCESS, WARNING, WatchTerminal,
+    print_usage, usage_plan, usage_recency, watch_exit_requested,
+};
 use crate::{Error, Result};
 
 #[derive(Debug, Parser)]
@@ -33,8 +38,30 @@ enum CliCommand {
         #[arg(long)]
         yes: bool,
     },
-    /// List enrolled accounts and their last known quota.
-    List,
+    /// List enrolled accounts and their quota.
+    List {
+        /// Keep the live list open and refresh it periodically.
+        #[arg(short, long)]
+        watch: bool,
+        /// Seconds between refreshes in watch mode.
+        #[arg(
+            long,
+            default_value_t = 60,
+            requires = "watch",
+            value_parser = clap::value_parser!(u64).range(5..)
+        )]
+        interval: u64,
+    },
+    /// Keep the live quota dashboard open.
+    Watch {
+        /// Seconds between refreshes.
+        #[arg(
+            long,
+            default_value_t = 60,
+            value_parser = clap::value_parser!(u64).range(5..)
+        )]
+        interval: u64,
+    },
     /// Show the selected account and credential-file state.
     Status,
     /// Switch by slot number or a unique part of the account email.
@@ -42,7 +69,10 @@ enum CliCommand {
     /// Enroll a new ChatGPT OAuth account.
     #[command(trailing_var_arg = true)]
     Add {
-        #[arg(allow_hyphen_values = true)]
+        /// Sign in with Codex's device-code flow.
+        #[arg(long)]
+        device_auth: bool,
+        #[arg(allow_hyphen_values = true, hide = true)]
         options: Vec<OsString>,
     },
     /// Import an existing Codex auth.json file.
@@ -61,10 +91,17 @@ pub fn run(cli: Cli, config: Config) -> Result<()> {
     let app = App::new(config);
     match (cli.command, cli.account) {
         (Some(CliCommand::Init { yes }), _) => app.init(yes),
-        (Some(CliCommand::List), _) => app.list(),
+        (Some(CliCommand::List { watch, interval }), _) => app.list(watch, interval),
+        (Some(CliCommand::Watch { interval }), _) => app.list(true, interval),
         (Some(CliCommand::Status), _) | (None, None) => app.status(true),
         (Some(CliCommand::Use { account }), _) | (None, Some(account)) => app.switch(&account),
-        (Some(CliCommand::Add { options }), _) => app.add(&options),
+        (
+            Some(CliCommand::Add {
+                device_auth,
+                options,
+            }),
+            _,
+        ) => app.add(device_auth, &options),
         (Some(CliCommand::Import { auth_file }), _) => app.import(&auth_file),
         (Some(CliCommand::Relogin { account, options }), _) => app.relogin(&account, &options),
     }
@@ -149,39 +186,162 @@ impl App {
         Ok(())
     }
 
-    fn list(&self) -> Result<()> {
+    fn list(&self, watch: bool, interval: u64) -> Result<()> {
+        let mut region = LiveRegion::new();
+        if watch && !(region.is_active() && io::stdin().is_terminal()) {
+            return Err(Error::Message(
+                "Watch mode requires an interactive terminal.".into(),
+            ));
+        }
+        if !watch {
+            let ListRefresh::Completed { session_changed } =
+                self.refresh_list(&mut region, false, false)?
+            else {
+                unreachable!("one-shot lists do not read keyboard input");
+            };
+            if session_changed {
+                restart_notice();
+            }
+            return Ok(());
+        }
+
+        let _terminal = WatchTerminal::enter().map_err(|error| Error::io("terminal", error))?;
+        let mut restart_required = false;
+        loop {
+            match self.refresh_list(&mut region, true, true)? {
+                ListRefresh::Completed { session_changed } => {
+                    restart_required |= session_changed;
+                }
+                ListRefresh::ExitRequested => return Ok(()),
+            }
+            for remaining in (1..=interval).rev() {
+                let status = watch_status(remaining, restart_required);
+                region
+                    .write_status(&status)
+                    .map_err(|error| Error::io("stdout", error))?;
+                if watch_exit_requested(Duration::from_secs(1))
+                    .map_err(|error| Error::io("terminal input", error))?
+                {
+                    return Ok(());
+                }
+            }
+        }
+    }
+
+    fn refresh_list(
+        &self,
+        region: &mut LiveRegion,
+        force_refresh: bool,
+        watch: bool,
+    ) -> Result<ListRefresh> {
         let _lock = self.locked()?;
         let profiles = self.store.profiles()?;
         if profiles.is_empty() {
-            println!("{}", self.initialization_guidance());
-            return Ok(());
-        }
-        let mut session_changed = false;
-        for profile in &profiles {
-            session_changed |= self.refresh_usage(profile.slot)?;
+            region
+                .redraw(|| {
+                    println!("{}", self.initialization_guidance());
+                    1
+                })
+                .map_err(|error| Error::io("stdout", error))?;
+            return Ok(ListRefresh::Completed {
+                session_changed: false,
+            });
         }
         let selected = self.store.selected();
-        for profile in profiles {
-            let marker = if selected == Some(profile.slot) {
-                "*"
+        let mut states: Vec<ProfileUsage> = profiles
+            .iter()
+            .map(|profile| {
+                if !self.store.config.skip_usage_refresh
+                    && (force_refresh || self.needs_usage_refresh(profile.slot))
+                {
+                    ProfileUsage::Loading
+                } else {
+                    ProfileUsage::Ready(self.store.usage(profile.slot))
+                }
+            })
+            .collect();
+        let refresh_slots: Vec<u32> = profiles
+            .iter()
+            .zip(&states)
+            .filter_map(|(profile, state)| state.is_loading().then_some(profile.slot))
+            .collect();
+        let mut frame = 0;
+        if region.is_active() && !refresh_slots.is_empty() {
+            region
+                .redraw(|| print_profile_list(&profiles, selected, &states, now_epoch(), frame))
+                .map_err(|error| Error::io("stdout", error))?;
+        }
+
+        let (sender, receiver) = mpsc::channel();
+        let mut workers = Vec::new();
+        for slot in refresh_slots {
+            let sender = sender.clone();
+            let config = self.store.config.clone();
+            workers.push(thread::spawn(move || {
+                let result = refresh_usage_for_config(&config, slot, force_refresh);
+                let _ = sender.send((slot, result));
+            }));
+        }
+        drop(sender);
+
+        let mut session_changed = false;
+        let mut first_error = None;
+        let refresh_total = workers.len();
+        let mut completed = 0;
+        while completed < refresh_total {
+            let received = if region.is_active() {
+                match receiver.recv_timeout(Duration::from_millis(80)) {
+                    Ok(result) => Some(result),
+                    Err(RecvTimeoutError::Timeout) => None,
+                    Err(RecvTimeoutError::Disconnected) => break,
+                }
             } else {
-                " "
+                receiver.recv().ok()
             };
-            let usage = self
-                .store
-                .usage(profile.slot)
-                .map(|usage| usage.label(now_epoch()))
-                .unwrap_or_else(|| "usage unknown".into());
-            println!(
-                "{ACCENT}{marker} {}{ACCENT:#}  {EMPHASIS}{}{EMPHASIS:#}  {MUTED}{usage}{MUTED:#}",
-                profile.slot,
-                profile.auth.identity.label()
-            );
+            if let Some((slot, result)) = received {
+                completed += 1;
+                match result {
+                    Ok(changed) => session_changed |= changed,
+                    Err(error) if first_error.is_none() => first_error = Some(error),
+                    Err(_) => {}
+                }
+                if let Some((index, _)) = profiles
+                    .iter()
+                    .enumerate()
+                    .find(|(_, profile)| profile.slot == slot)
+                {
+                    states[index] = ProfileUsage::Ready(self.store.usage(slot));
+                }
+            }
+            if region.is_active() {
+                frame += 1;
+                region
+                    .redraw(|| print_profile_list(&profiles, selected, &states, now_epoch(), frame))
+                    .map_err(|error| Error::io("stdout", error))?;
+            }
+            if watch
+                && watch_exit_requested(Duration::ZERO)
+                    .map_err(|error| Error::io("terminal input", error))?
+            {
+                return Ok(ListRefresh::ExitRequested);
+            }
         }
-        if session_changed {
-            restart_notice();
+        for worker in workers {
+            if worker.join().is_err() && first_error.is_none() {
+                first_error = Some(Error::Message("usage refresh worker failed".into()));
+            }
         }
-        Ok(())
+        if region.is_active() {
+            region
+                .redraw(|| print_profile_list(&profiles, selected, &states, now_epoch(), frame))
+                .map_err(|error| Error::io("stdout", error))?;
+        } else {
+            print_profile_list(&profiles, selected, &states, now_epoch(), frame);
+        }
+        if let Some(error) = first_error {
+            return Err(error);
+        }
+        Ok(ListRefresh::Completed { session_changed })
     }
 
     fn status(&self, refresh: bool) -> Result<()> {
@@ -194,8 +354,27 @@ impl App {
             .store
             .selected()
             .ok_or_else(|| Error::Message("No Codex account is selected.".into()))?;
-        let session_changed = refresh && self.refresh_usage(selected)?;
-        self.print_status_lines()?;
+        let profile = self.store.resolve(&selected.to_string())?;
+        let session_changed = if refresh && self.needs_usage_refresh(selected) {
+            let spinner = FetchSpinner::start(format!(
+                "Fetching usage [1/1] {}",
+                profile.auth.identity.label()
+            ));
+            let changed = self.refresh_usage(selected)?;
+            spinner.finish();
+            changed
+        } else {
+            false
+        };
+        let usage = self.store.usage(selected);
+        print_profile(&profile, true, usage.as_ref(), now_epoch());
+        let credential = self.store.credential_status(selected)?;
+        let style = if credential.starts_with("matches") {
+            SUCCESS
+        } else {
+            WARNING
+        };
+        println!("    {ACCENT}Credential{ACCENT:#}  {style}{credential}{style:#}");
         if session_changed {
             restart_notice();
         }
@@ -213,18 +392,11 @@ impl App {
     }
 
     fn refresh_usage(&self, slot: u32) -> Result<bool> {
-        if self.store.config.skip_usage_refresh || self.store.usage_fresh(slot) {
-            return Ok(false);
-        }
-        let previous = self.store.usage(slot);
-        let (next, session_changed) =
-            query_profile(&self.store.config, &self.store.config.profile_auth(slot));
-        write_usage_result(
-            previous.as_ref(),
-            &next,
-            &self.store.config.profile_usage(slot),
-        )?;
-        Ok(session_changed)
+        refresh_usage_for_config(&self.store.config, slot, false)
+    }
+
+    fn needs_usage_refresh(&self, slot: u32) -> bool {
+        !self.store.config.skip_usage_refresh && !self.store.usage_fresh(slot)
     }
 
     fn switch(&self, selector: &str) -> Result<()> {
@@ -251,10 +423,14 @@ impl App {
         Ok(())
     }
 
-    fn add(&self, options: &[OsString]) -> Result<()> {
-        reject_non_oauth(options)?;
+    fn add(&self, device_auth: bool, options: &[OsString]) -> Result<()> {
+        let mut options = options.to_vec();
+        if device_auth {
+            options.push("--device-auth".into());
+        }
+        reject_non_oauth(&options)?;
         let _lock = self.locked()?;
-        let login = StagedLogin::run(&self.store.config, options)?;
+        let login = StagedLogin::run(&self.store.config, &options)?;
         let profile = self.store.enroll(&login.auth_path())?;
         println!(
             "\n{SUCCESS}✓{SUCCESS:#} Enrolled {EMPHASIS}{}{EMPHASIS:#} as account {ACCENT}{}{ACCENT:#}.",
@@ -306,52 +482,142 @@ impl App {
         );
         Ok(())
     }
+}
 
-    fn print_status_lines(&self) -> Result<()> {
-        let selected = self.store.selected();
-        let usage = selected.and_then(|slot| self.store.usage(slot));
-        let quota_style = usage_style(usage.as_ref(), now_epoch());
-        for line in self.store.status_lines()? {
-            print_status_line(&line, quota_style);
-        }
-        Ok(())
+enum ListRefresh {
+    Completed { session_changed: bool },
+    ExitRequested,
+}
+
+enum ProfileUsage {
+    Loading,
+    Ready(Option<UsageRecord>),
+}
+
+impl ProfileUsage {
+    fn is_loading(&self) -> bool {
+        matches!(self, Self::Loading)
     }
+}
+
+const LOADING_FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+
+fn watch_status(remaining: u64, restart_required: bool) -> String {
+    let remaining = interval_label(remaining);
+    if restart_required {
+        format!(
+            "{WARNING}! Restart Codex/ChatGPT{WARNING:#} {MUTED}· refresh in {remaining} · Ctrl-C to exit{MUTED:#}"
+        )
+    } else {
+        format!("{MUTED}Watching · refresh in {remaining} · Ctrl-C to exit{MUTED:#}")
+    }
+}
+
+fn interval_label(seconds: u64) -> String {
+    if seconds >= 60 {
+        format!("{}m {:02}s", seconds / 60, seconds % 60)
+    } else {
+        format!("{seconds}s")
+    }
+}
+
+fn print_profile_list(
+    profiles: &[Profile],
+    selected: Option<u32>,
+    states: &[ProfileUsage],
+    now: i64,
+    frame: usize,
+) -> usize {
+    let mut lines = 0;
+    for (index, (profile, state)) in profiles.iter().zip(states).enumerate() {
+        if index > 0 {
+            println!();
+            lines += 1;
+        }
+        match state {
+            ProfileUsage::Loading => {
+                print_loading_profile(profile, selected == Some(profile.slot), frame);
+                lines += 1;
+            }
+            ProfileUsage::Ready(usage) => {
+                print_profile(profile, selected == Some(profile.slot), usage.as_ref(), now);
+                lines += profile_line_count(usage.as_ref());
+            }
+        }
+    }
+    lines
+}
+
+fn print_loading_profile(profile: &Profile, selected: bool, frame: usize) {
+    let marker = if selected { "*" } else { " " };
+    let spinner = LOADING_FRAMES[frame % LOADING_FRAMES.len()];
+    println!(
+        "{ACCENT}{marker} {}{ACCENT:#}  {EMPHASIS}{}{EMPHASIS:#}  {ACCENT}{spinner}{ACCENT:#} {MUTED}loading{MUTED:#}",
+        profile.slot,
+        profile.auth.identity.label()
+    );
+}
+
+fn profile_line_count(usage: Option<&UsageRecord>) -> usize {
+    let usage_lines = match usage {
+        None => 1,
+        Some(usage) if usage.error.is_some() || usage.buckets.is_empty() => 1,
+        Some(usage) => usage
+            .buckets
+            .iter()
+            .map(|bucket| 1 + bucket.windows().count())
+            .sum(),
+    };
+    1 + usage_lines
+}
+
+fn refresh_usage_for_config(config: &Config, slot: u32, force_refresh: bool) -> Result<bool> {
+    let store = Store::new(config.clone());
+    if config.skip_usage_refresh || (!force_refresh && store.usage_fresh(slot)) {
+        return Ok(false);
+    }
+    let previous = store.usage(slot);
+    let (next, session_changed) = query_profile(config, &config.profile_auth(slot));
+    write_usage_result(previous.as_ref(), &next, &config.profile_usage(slot))?;
+    Ok(session_changed)
+}
+
+fn print_profile(profile: &Profile, selected: bool, usage: Option<&UsageRecord>, now: i64) {
+    let marker = if selected { "*" } else { " " };
+    let plan = usage_plan(usage);
+    let recency = usage_recency(usage, now);
+    if let (Some(plan), Some(recency)) = (plan.as_deref(), recency.as_deref()) {
+        println!(
+            "{ACCENT}{marker} {}{ACCENT:#}  {EMPHASIS}{}{EMPHASIS:#}  {MUTED}{plan} · {recency}{MUTED:#}",
+            profile.slot,
+            profile.auth.identity.label()
+        );
+    } else if let Some(plan) = plan {
+        println!(
+            "{ACCENT}{marker} {}{ACCENT:#}  {EMPHASIS}{}{EMPHASIS:#}  {MUTED}{plan}{MUTED:#}",
+            profile.slot,
+            profile.auth.identity.label()
+        );
+    } else if let Some(recency) = recency {
+        println!(
+            "{ACCENT}{marker} {}{ACCENT:#}  {EMPHASIS}{}{EMPHASIS:#}  {MUTED}{recency}{MUTED:#}",
+            profile.slot,
+            profile.auth.identity.label()
+        );
+    } else {
+        println!(
+            "{ACCENT}{marker} {}{ACCENT:#}  {EMPHASIS}{}{EMPHASIS:#}",
+            profile.slot,
+            profile.auth.identity.label()
+        );
+    }
+    print_usage(usage, now);
 }
 
 fn restart_notice() {
     println!(
         "{WARNING}!{WARNING:#} Restart Codex or ChatGPT before expecting an existing session to use this account."
     );
-}
-
-fn usage_style(usage: Option<&UsageRecord>, now: i64) -> Style {
-    let Some(usage) = usage else {
-        return WARNING;
-    };
-    let max_used = usage.max_current_used_percent(now);
-    if usage.exhausted_now(now) || max_used.is_some_and(|percent| percent >= 100.0) {
-        return ERROR;
-    }
-    if !usage.succeeded() || max_used.is_some_and(|percent| percent >= 80.0) {
-        WARNING
-    } else {
-        SUCCESS
-    }
-}
-
-fn print_status_line(line: &str, quota_style: Style) {
-    let Some((label, value)) = line.split_once(": ") else {
-        println!("{line}");
-        return;
-    };
-    let value_style = match label {
-        "Selected Codex account" => EMPHASIS,
-        "Quota" => quota_style,
-        "Credential file" if value.starts_with("matches") => SUCCESS,
-        "Credential file" => WARNING,
-        _ => Style::new(),
-    };
-    println!("{ACCENT}{label}{ACCENT:#}: {value_style}{value}{value_style:#}");
 }
 
 fn write_usage_result(
@@ -446,5 +712,12 @@ mod tests {
         assert_eq!(retained.observed_at, 1);
         assert_eq!(retained.last_attempted_at, 2);
         assert!(retained.succeeded());
+    }
+
+    #[test]
+    fn watch_countdown_uses_compact_time() {
+        assert_eq!(interval_label(5), "5s");
+        assert_eq!(interval_label(60), "1m 00s");
+        assert_eq!(interval_label(125), "2m 05s");
     }
 }

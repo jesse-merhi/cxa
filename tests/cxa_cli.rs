@@ -42,6 +42,9 @@ case "$*" in
   ;;
 esac
 if [ "$1" = login ] && [ -n "$FAKE_AUTH" ]; then
+  if [ -n "$FAKE_LOGIN_ARGS" ]; then
+    printf '%s\n' "$@" > "$FAKE_LOGIN_ARGS"
+  fi
   cp "$FAKE_AUTH" "$CODEX_HOME/auth.json"
   exit 0
 fi
@@ -351,10 +354,12 @@ fn add_runs_login_in_an_isolated_home() {
         "account-two",
         "token-two",
     );
+    let login_args = case.home.join("login-args.txt");
     let output = case
         .command()
         .env("FAKE_AUTH", &fresh)
-        .arg("add")
+        .env("FAKE_LOGIN_ARGS", &login_args)
+        .args(["add", "--device-auth"])
         .output()
         .unwrap();
 
@@ -366,6 +371,12 @@ fn add_runs_login_in_an_isolated_home() {
     assert_eq!(
         access_token(&case.codex_home.join("auth.json")),
         "token-one"
+    );
+    assert!(
+        fs::read_to_string(login_args)
+            .unwrap()
+            .lines()
+            .any(|argument| argument == "--device-auth")
     );
 }
 
@@ -518,12 +529,29 @@ case "$CODEX_HOME" in
     exit 0
     ;;
 esac
-if grep -q token-one "$CODEX_HOME/auth.json"; then used=11; else used=77; fi
+if grep -q token-one "$CODEX_HOME/auth.json"; then
+  used=11
+  spark=0
+  account=one
+else
+  used=77
+  spark=100
+  account=two
+fi
+touch "$CXA_ACCOUNT_STORE/$account.started"
+attempt=0
+while [ ! -e "$CXA_ACCOUNT_STORE/one.started" ] || [ ! -e "$CXA_ACCOUNT_STORE/two.started" ]; do
+  attempt=$((attempt + 1))
+  [ "$attempt" -lt 100 ] || exit 9
+  sleep 0.01
+done
 while IFS= read -r line; do
   case "$line" in
     *'"id":0'*) printf '%s\n' '{"id":0,"result":{}}' ;;
     *'"id":1'*) printf '%s\n' '{"id":1,"result":{}}' ;;
-    *'"id":2'*) printf '{"id":2,"result":{"rateLimits":{"primary":{"usedPercent":%s}}}}\n' "$used" ;;
+    *'"id":2'*)
+      printf '{"id":2,"result":{"rateLimitsByLimitId":{"codex":{"limitId":"codex","planType":"pro","primary":{"usedPercent":%s,"windowDurationMins":10080}},"codex_bengalfox":{"limitId":"codex_bengalfox","limitName":"GPT-5.3-Codex-Spark","planType":"pro","primary":{"usedPercent":0,"windowDurationMins":300},"secondary":{"usedPercent":%s,"windowDurationMins":10080}}}}}\n' "$used" "$spark"
+      ;;
   esac
 done
 "#,
@@ -539,8 +567,14 @@ done
 
     assert_success(&output);
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("primary 11% used"));
-    assert!(stdout.contains("primary 77% used"));
+    assert!(stdout.contains("one@example.com  Pro 20x · updated just now"));
+    assert!(stdout.contains("11% used"));
+    assert!(stdout.contains("77% used"));
+    assert!(stdout.contains("Codex Spark  EXHAUSTED"));
+    assert!(stdout.contains("[████████████████] 100% used"));
+    assert!(!stdout.contains("codex primary"));
+    assert!(stdout.lines().all(|line| line.chars().count() <= 80));
+    assert!(!String::from_utf8_lossy(&output.stderr).contains("Fetching usage"));
 }
 
 #[test]
@@ -555,10 +589,7 @@ fn status_infers_selection_when_codex_changes_to_an_enrolled_account() {
     let output = case.run(&["status"]);
 
     assert_success(&output);
-    assert!(
-        String::from_utf8_lossy(&output.stdout)
-            .contains("Selected Codex account: 2  two@example.com")
-    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("* 2  two@example.com"));
 }
 
 #[test]
@@ -598,6 +629,22 @@ fn redirected_output_contains_no_colour_codes() {
 
     assert_success(&output);
     assert!(!output.stdout.windows(2).any(|bytes| bytes == b"\x1b["));
+}
+
+#[test]
+fn watch_requires_an_interactive_terminal() {
+    let case = Case::new();
+    case.seed("one@example.com", "user-one", "account-one");
+
+    for arguments in [["watch"].as_slice(), ["list", "--watch"].as_slice()] {
+        let output = case.run(arguments);
+
+        assert!(!output.status.success());
+        assert!(
+            String::from_utf8_lossy(&output.stderr)
+                .contains("Watch mode requires an interactive terminal")
+        );
+    }
 }
 
 #[test]

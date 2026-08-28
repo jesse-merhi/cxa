@@ -40,7 +40,7 @@ pub struct UsageBucket {
 }
 
 impl UsageBucket {
-    fn windows(&self) -> impl Iterator<Item = (&'static str, &UsageWindow)> {
+    pub fn windows(&self) -> impl Iterator<Item = (&'static str, &UsageWindow)> {
         [
             ("primary", self.primary_window.as_ref()),
             ("secondary", self.secondary_window.as_ref()),
@@ -50,7 +50,7 @@ impl UsageBucket {
         .filter_map(|(name, window)| window.map(|window| (name, window)))
     }
 
-    fn exhausted_now(&self, now: i64) -> bool {
+    pub fn exhausted_now(&self, now: i64) -> bool {
         if self.spend_control_reached {
             return self
                 .individual_window
@@ -378,25 +378,32 @@ impl Store {
                 .map(|usage| usage.label(now_epoch()))
                 .unwrap_or_else(|| "usage unknown".into())
         ));
-        match AuthDocument::read(&self.config.session_auth) {
+        lines.push(format!(
+            "Credential file: {}",
+            self.credential_status(selected)?
+        ));
+        Ok(lines)
+    }
+
+    pub fn credential_status(&self, selected: u32) -> Result<String> {
+        let profile = self.resolve(&selected.to_string())?;
+        let status = match AuthDocument::read(&self.config.session_auth) {
             Ok(session) if session.identity.same_account(&profile.auth.identity) => {
-                lines.push("Credential file: matches the selected account".into());
+                "matches the selected account".into()
             }
             Ok(session) => {
                 let label = self
                     .slot_for_identity(&session.identity)?
                     .map(|slot| format!("account {slot}"))
                     .unwrap_or_else(|| session.identity.label().to_owned());
-                lines.push(format!(
-                    "Credential file: {label}; run `cxa {selected}` to replace it"
-                ));
+                format!("{label}; run `cxa {selected}` to replace it")
             }
-            Err(_) => lines.push(format!(
-                "Credential file: missing or invalid at {}",
+            Err(_) => format!(
+                "missing or invalid at {}",
                 self.config.session_auth.display()
-            )),
-        }
-        Ok(lines)
+            ),
+        };
+        Ok(status)
     }
 }
 
