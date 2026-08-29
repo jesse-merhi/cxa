@@ -2,7 +2,9 @@ use std::io::{Read, Write};
 use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::{Child, ChildStdin, Command, Stdio};
-use std::sync::mpsc::{self, Receiver};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
@@ -18,9 +20,42 @@ const MAX_MESSAGE_SIZE: usize = 4 * 1024 * 1024;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
 
 pub fn query_profile(config: &Config, source_auth: &Path) -> (UsageRecord, bool) {
-    match query_profile_inner(config, source_auth) {
+    match query_profile_inner(config, source_auth, CancellationToken::default()) {
         Ok((usage, session_changed)) => (usage.unwrap_or_else(unavailable_usage), session_changed),
         Err(error) => (unavailable_usage(error), false),
+    }
+}
+
+#[derive(Clone, Default)]
+pub struct CancellationToken(Arc<AtomicBool>);
+
+impl CancellationToken {
+    pub fn cancel(&self) {
+        self.0.store(true, Ordering::Relaxed);
+    }
+
+    fn is_cancelled(&self) -> bool {
+        self.0.load(Ordering::Relaxed)
+    }
+}
+
+pub fn query_profile_cancellable(
+    config: &Config,
+    source_auth: &Path,
+    cancellation: CancellationToken,
+) -> Result<(UsageRecord, bool)> {
+    normalize_cancellable_query(query_profile_inner(config, source_auth, cancellation))
+}
+
+fn normalize_cancellable_query(
+    result: Result<(Result<UsageRecord>, bool)>,
+) -> Result<(UsageRecord, bool)> {
+    match result {
+        Ok((Err(Error::Cancelled), _)) | Err(Error::Cancelled) => Err(Error::Cancelled),
+        Ok((usage, session_changed)) => {
+            Ok((usage.unwrap_or_else(unavailable_usage), session_changed))
+        }
+        Err(error) => Ok((unavailable_usage(error), false)),
     }
 }
 
@@ -40,6 +75,7 @@ pub fn require_file_credentials(config: &Config) -> Result<()> {
         config.codex_binary(),
         &config.codex_home,
         CredentialStore::Effective,
+        CancellationToken::default(),
     )?;
     let checked = effective_credential_store(&mut client).and_then(|mode| {
         if mode == "file" {
@@ -55,7 +91,11 @@ pub fn require_file_credentials(config: &Config) -> Result<()> {
     stopped
 }
 
-fn query_profile_inner(config: &Config, source_auth: &Path) -> Result<(Result<UsageRecord>, bool)> {
+fn query_profile_inner(
+    config: &Config,
+    source_auth: &Path,
+    cancellation: CancellationToken,
+) -> Result<(Result<UsageRecord>, bool)> {
     private_dir(&config.account_store)?;
     let original_auth = AuthDocument::read(source_auth)?;
     let home = Builder::new()
@@ -72,6 +112,7 @@ fn query_profile_inner(config: &Config, source_auth: &Path) -> Result<(Result<Us
         config.codex_binary(),
         home.path(),
         CredentialStore::ForceFile,
+        cancellation,
     )?;
     let usage = query(&mut client);
     client.finish()?;
@@ -239,6 +280,7 @@ struct SpawnedClient {
     child: ChildGuard,
     stdin: ChildStdin,
     messages: Receiver<std::result::Result<Value, String>>,
+    cancellation: CancellationToken,
 }
 
 enum CredentialStore {
@@ -247,7 +289,12 @@ enum CredentialStore {
 }
 
 impl SpawnedClient {
-    fn start(codex_binary: &Path, home: &Path, credential_store: CredentialStore) -> Result<Self> {
+    fn start(
+        codex_binary: &Path,
+        home: &Path,
+        credential_store: CredentialStore,
+        cancellation: CancellationToken,
+    ) -> Result<Self> {
         let mut command = Command::new(codex_binary);
         if matches!(credential_store, CredentialStore::ForceFile) {
             command.args(["-c", "cli_auth_credentials_store=\"file\""]);
@@ -281,6 +328,7 @@ impl SpawnedClient {
             child: ChildGuard(Some(child)),
             stdin,
             messages,
+            cancellation,
         })
     }
 
@@ -301,10 +349,25 @@ impl RpcClient for SpawnedClient {
     }
 
     fn receive(&mut self, deadline: Instant) -> Result<Value> {
-        self.messages
-            .recv_timeout(deadline.saturating_duration_since(Instant::now()))
-            .map_err(|_| Error::Timeout)?
-            .map_err(Error::Protocol)
+        loop {
+            if self.cancellation.is_cancelled() {
+                return Err(Error::Cancelled);
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(Error::Timeout);
+            }
+            match self
+                .messages
+                .recv_timeout(remaining.min(Duration::from_millis(80)))
+            {
+                Ok(message) => return message.map_err(Error::Protocol),
+                Err(RecvTimeoutError::Timeout) => {}
+                Err(RecvTimeoutError::Disconnected) => {
+                    return Err(Error::Protocol("app server closed its output".into()));
+                }
+            }
+        }
     }
 }
 
@@ -407,6 +470,23 @@ mod tests {
         );
         assert!(!usage.exhausted_now(now_epoch()));
         assert!(!usage.label(now_epoch()).contains("no credits"));
+    }
+
+    #[test]
+    fn cancellable_queries_only_propagate_cancellation() {
+        let (usage, session_changed) =
+            normalize_cancellable_query(Err(Error::Protocol("temporary setup failure".into())))
+                .unwrap();
+        assert!(!session_changed);
+        assert!(usage.error.as_deref().unwrap().contains("Protocol"));
+        assert!(matches!(
+            normalize_cancellable_query(Err(Error::Cancelled)),
+            Err(Error::Cancelled)
+        ));
+        assert!(matches!(
+            normalize_cancellable_query(Ok((Err(Error::Cancelled), false))),
+            Err(Error::Cancelled)
+        ));
     }
 
     #[test]

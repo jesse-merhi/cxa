@@ -14,18 +14,18 @@ pub struct ExclusiveLock {
 
 impl ExclusiveLock {
     pub fn acquire(path: &Path) -> Result<Self> {
-        if let Some(parent) = path.parent() {
-            private_dir(parent)?;
-        }
-        let file = OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .read(true)
-            .write(true)
-            .open(path)
-            .map_err(|error| Error::io(path, error))?;
+        let file = open_lock_file(path)?;
         flock(file.as_raw_fd(), libc::LOCK_EX).map_err(|error| Error::io(path, error))?;
         Ok(Self { file })
+    }
+
+    pub fn try_acquire(path: &Path) -> Result<Option<Self>> {
+        let file = open_lock_file(path)?;
+        match flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) {
+            Ok(()) => Ok(Some(Self { file })),
+            Err(error) if error.raw_os_error() == Some(libc::EWOULDBLOCK) => Ok(None),
+            Err(error) => Err(Error::io(path, error)),
+        }
     }
 }
 
@@ -42,6 +42,19 @@ fn flock(file: RawFd, operation: libc::c_int) -> std::io::Result<()> {
     } else {
         Err(std::io::Error::last_os_error())
     }
+}
+
+fn open_lock_file(path: &Path) -> Result<File> {
+    if let Some(parent) = path.parent() {
+        private_dir(parent)?;
+    }
+    OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(path)
+        .map_err(|error| Error::io(path, error))
 }
 
 pub fn private_dir(path: &Path) -> Result<()> {

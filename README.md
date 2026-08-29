@@ -72,8 +72,19 @@ new account.
 
 ```text
 $ cxa list
-* 1  personal@example.com  primary 18% used, secondary 41% used, seen just now
-  2  work@example.com  primary 63% used, secondary 9% used, seen just now
+* 1  personal@example.com  Pro 20x · updated just now
+    Codex
+      Weekly   [███░░░░░░░░░░░░░]  18% used  resets in 6d 11h
+    Codex Spark
+      5-hour   [███████░░░░░░░░░]  41% used  resets in 4h 12m
+      Weekly   [█░░░░░░░░░░░░░░░]   9% used  resets in 6d 23h
+
+  2  work@example.com  Pro 20x · updated just now
+    Codex
+      Weekly   [██████████░░░░░░]  63% used  resets in 3d 8h
+    Codex Spark
+      5-hour   [░░░░░░░░░░░░░░░░]   0% used  resets in 4h 48m
+      Weekly   [██░░░░░░░░░░░░░░]  12% used  resets in 5d 17h
 
 $ cxa 2
 ✓ Account 2 (work@example.com) is now selected.
@@ -82,6 +93,15 @@ $ cxa 2
 
 The `*` marks the account currently selected in Codex.
 
+When quota data is stale, an interactive terminal immediately lists every
+account with an animated loading indicator, fetches them in parallel, and fills
+each account in as it responds. Redirected output skips the live display and
+prints the completed list once.
+
+Keep the dashboard open with `cxa watch`. It refreshes every 60 seconds; use
+`--interval SECONDS` to change the cadence, and press `q` or Ctrl-C to exit.
+`cxa list --watch` remains available as the explicit form.
+
 ## Commands
 
 | Command | Description |
@@ -89,7 +109,11 @@ The `*` marks the account currently selected in Codex.
 | `cxa` | Show the selected account and credential state |
 | `cxa init` | Import the current Codex login as account 1 |
 | `cxa add` | Sign in and add another account |
+| `cxa add --device-auth` | Add an account with Codex's device-code flow |
 | `cxa list` | List accounts and their latest known quota |
+| `cxa watch` | Keep the live quota dashboard open |
+| `cxa watch --interval 30` | Refresh every 30 seconds |
+| `cxa list --watch` | Open watch mode through `list` |
 | `cxa <account>` | Switch by account number or email |
 | `cxa use <account>` | Switch using the explicit command form |
 | `cxa status` | Show the selected account and credential state |

@@ -1,7 +1,12 @@
-use std::fs;
+use std::fs::{self, File};
+use std::io::Write as _;
+use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt, symlink};
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -14,6 +19,169 @@ struct Case {
     codex_home: PathBuf,
     codex: PathBuf,
     store: PathBuf,
+}
+
+struct PtyChild {
+    child: Child,
+    master: File,
+    _slave: File,
+    original_mode: libc::termios,
+    output: Vec<u8>,
+}
+
+impl PtyChild {
+    fn spawn(mut command: Command) -> Self {
+        let mut master_fd = -1;
+        let mut slave_fd = -1;
+        assert_eq!(
+            unsafe {
+                libc::openpty(
+                    &mut master_fd,
+                    &mut slave_fd,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                )
+            },
+            0
+        );
+        let master = unsafe { File::from_raw_fd(master_fd) };
+        let slave = unsafe { File::from_raw_fd(slave_fd) };
+        let mut original_mode = unsafe { std::mem::zeroed::<libc::termios>() };
+        assert_eq!(unsafe { libc::tcgetattr(slave_fd, &mut original_mode) }, 0);
+
+        command
+            .stdin(Stdio::from(slave.try_clone().unwrap()))
+            .stdout(Stdio::from(slave.try_clone().unwrap()))
+            .stderr(Stdio::from(slave.try_clone().unwrap()));
+        unsafe {
+            command.pre_exec(move || {
+                if libc::setsid() == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                if libc::ioctl(slave_fd, libc::TIOCSCTTY as libc::c_ulong, 0) == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let child = command.spawn().unwrap();
+        Self {
+            child,
+            master,
+            _slave: slave,
+            original_mode,
+            output: Vec::new(),
+        }
+    }
+
+    fn wait_for_output(&mut self, expected: &[u8]) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            self.read_available(Duration::from_millis(100));
+            if self
+                .output
+                .windows(expected.len())
+                .any(|window| window == expected)
+            {
+                return;
+            }
+        }
+        panic!(
+            "PTY output never contained {:?}: {}",
+            String::from_utf8_lossy(expected),
+            String::from_utf8_lossy(&self.output)
+        );
+    }
+
+    fn send(&mut self, input: &[u8]) {
+        self.master.write_all(input).unwrap();
+        self.master.flush().unwrap();
+    }
+
+    fn signal(&self, signal: libc::c_int) {
+        assert_eq!(
+            unsafe { libc::kill(self.child.id() as libc::pid_t, signal) },
+            0
+        );
+    }
+
+    fn wait_success(&mut self) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Some(status) = self.child.try_wait().unwrap() {
+                self.read_available(Duration::from_millis(100));
+                assert!(
+                    status.success(),
+                    "PTY child failed with {status}: {}",
+                    String::from_utf8_lossy(&self.output)
+                );
+                return;
+            }
+            if Instant::now() >= deadline {
+                let _ = self.child.kill();
+                let _ = self.child.wait();
+                panic!(
+                    "PTY child did not exit: {}",
+                    String::from_utf8_lossy(&self.output)
+                );
+            }
+            self.read_available(Duration::from_millis(50));
+        }
+    }
+
+    fn assert_terminal_restored(&self) {
+        let mut current = unsafe { std::mem::zeroed::<libc::termios>() };
+        assert_eq!(
+            unsafe { libc::tcgetattr(self.master.as_raw_fd(), &mut current) },
+            0
+        );
+        let interactive_flags = libc::ICANON | libc::ECHO;
+        assert_eq!(
+            current.c_lflag & interactive_flags,
+            self.original_mode.c_lflag & interactive_flags
+        );
+        assert!(
+            self.output
+                .windows(b"\x1b[?25h".len())
+                .any(|window| window == b"\x1b[?25h"),
+            "cursor-show sequence missing from {}",
+            String::from_utf8_lossy(&self.output)
+        );
+    }
+
+    fn read_available(&mut self, timeout: Duration) {
+        let mut descriptor = libc::pollfd {
+            fd: self.master.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let timeout_ms = timeout.as_millis().min(libc::c_int::MAX as u128) as libc::c_int;
+        let ready = unsafe { libc::poll(&mut descriptor, 1, timeout_ms) };
+        if ready <= 0 || descriptor.revents & libc::POLLIN == 0 {
+            return;
+        }
+        let mut bytes = [0_u8; 4096];
+        let read = unsafe {
+            libc::read(
+                self.master.as_raw_fd(),
+                bytes.as_mut_ptr().cast(),
+                bytes.len(),
+            )
+        };
+        if read > 0 {
+            self.output.extend_from_slice(&bytes[..read as usize]);
+        }
+    }
+}
+
+impl Drop for PtyChild {
+    fn drop(&mut self) {
+        if self.child.try_wait().ok().flatten().is_none() {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
 }
 
 impl Case {
@@ -42,6 +210,9 @@ case "$*" in
   ;;
 esac
 if [ "$1" = login ] && [ -n "$FAKE_AUTH" ]; then
+  if [ -n "$FAKE_LOGIN_ARGS" ]; then
+    printf '%s\n' "$@" > "$FAKE_LOGIN_ARGS"
+  fi
   cp "$FAKE_AUTH" "$CODEX_HOME/auth.json"
   exit 0
 fi
@@ -351,9 +522,11 @@ fn add_runs_login_in_an_isolated_home() {
         "account-two",
         "token-two",
     );
+    let login_args = case.home.join("login-args.txt");
     let output = case
         .command()
         .env("FAKE_AUTH", &fresh)
+        .env("FAKE_LOGIN_ARGS", &login_args)
         .arg("add")
         .output()
         .unwrap();
@@ -366,6 +539,42 @@ fn add_runs_login_in_an_isolated_home() {
     assert_eq!(
         access_token(&case.codex_home.join("auth.json")),
         "token-one"
+    );
+    assert!(
+        !fs::read_to_string(login_args)
+            .unwrap()
+            .lines()
+            .any(|argument| argument == "--device-auth")
+    );
+}
+
+#[test]
+fn add_forwards_device_auth_to_codex_login() {
+    let case = Case::new();
+    case.seed("one@example.com", "user-one", "account-one");
+    let fresh = case.home.join("fresh.json");
+    write_auth(
+        &fresh,
+        "two@example.com",
+        "user-two",
+        "account-two",
+        "token-two",
+    );
+    let login_args = case.home.join("login-args.txt");
+    let output = case
+        .command()
+        .env("FAKE_AUTH", &fresh)
+        .env("FAKE_LOGIN_ARGS", &login_args)
+        .args(["add", "--device-auth"])
+        .output()
+        .unwrap();
+
+    assert_success(&output);
+    assert!(
+        fs::read_to_string(login_args)
+            .unwrap()
+            .lines()
+            .any(|argument| argument == "--device-auth")
     );
 }
 
@@ -518,12 +727,30 @@ case "$CODEX_HOME" in
     exit 0
     ;;
 esac
-if grep -q token-one "$CODEX_HOME/auth.json"; then used=11; else used=77; fi
+if grep -q token-one "$CODEX_HOME/auth.json"; then
+  used=11
+  spark=0
+  account=one
+else
+  used=77
+  spark=100
+  account=two
+fi
+touch "$CXA_ACCOUNT_STORE/$account.started"
+attempt=0
+while [ ! -e "$CXA_ACCOUNT_STORE/one.started" ] || [ ! -e "$CXA_ACCOUNT_STORE/two.started" ]; do
+  attempt=$((attempt + 1))
+  [ "$attempt" -lt 100 ] || exit 9
+  sleep 0.01
+done
+if [ "$account" = one ]; then sleep 0.2; fi
 while IFS= read -r line; do
   case "$line" in
     *'"id":0'*) printf '%s\n' '{"id":0,"result":{}}' ;;
     *'"id":1'*) printf '%s\n' '{"id":1,"result":{}}' ;;
-    *'"id":2'*) printf '{"id":2,"result":{"rateLimits":{"primary":{"usedPercent":%s}}}}\n' "$used" ;;
+    *'"id":2'*)
+      printf '{"id":2,"result":{"rateLimitsByLimitId":{"codex":{"limitId":"codex","planType":"pro","primary":{"usedPercent":%s,"windowDurationMins":10080}},"codex_bengalfox":{"limitId":"codex_bengalfox","limitName":"GPT-5.3-Codex-Spark","planType":"pro","primary":{"usedPercent":0,"windowDurationMins":300},"secondary":{"usedPercent":%s,"windowDurationMins":10080}}}}}\n' "$used" "$spark"
+      ;;
   esac
 done
 "#,
@@ -539,8 +766,18 @@ done
 
     assert_success(&output);
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("primary 11% used"));
-    assert!(stdout.contains("primary 77% used"));
+    let account_two = stdout.find("two@example.com").unwrap();
+    let account_one_output = &stdout[..account_two];
+    let account_two_output = &stdout[account_two..];
+    assert!(account_one_output.contains("one@example.com  Pro 20x · updated just now"));
+    assert!(account_one_output.contains("11% used"));
+    assert!(!account_one_output.contains("77% used"));
+    assert!(account_two_output.contains("77% used"));
+    assert!(account_two_output.contains("Codex Spark  EXHAUSTED"));
+    assert!(account_two_output.contains("[████████████████] 100% used"));
+    assert!(!stdout.contains("codex primary"));
+    assert!(stdout.lines().all(|line| line.chars().count() <= 80));
+    assert!(!String::from_utf8_lossy(&output.stderr).contains("Fetching usage"));
 }
 
 #[test]
@@ -555,10 +792,7 @@ fn status_infers_selection_when_codex_changes_to_an_enrolled_account() {
     let output = case.run(&["status"]);
 
     assert_success(&output);
-    assert!(
-        String::from_utf8_lossy(&output.stdout)
-            .contains("Selected Codex account: 2  two@example.com")
-    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("* 2  two@example.com"));
 }
 
 #[test]
@@ -598,6 +832,166 @@ fn redirected_output_contains_no_colour_codes() {
 
     assert_success(&output);
     assert!(!output.stdout.windows(2).any(|bytes| bytes == b"\x1b["));
+
+    let empty = Case::new();
+    let output = empty.run(&["list"]);
+    assert_success(&output);
+    assert!(!output.stdout.windows(2).any(|bytes| bytes == b"\x1b["));
+}
+
+#[test]
+fn watch_requires_an_interactive_terminal() {
+    let case = Case::new();
+    case.seed("one@example.com", "user-one", "account-one");
+
+    for arguments in [["watch"].as_slice(), ["list", "--watch"].as_slice()] {
+        let output = case.run(arguments);
+
+        assert!(!output.status.success());
+        assert!(
+            String::from_utf8_lossy(&output.stderr)
+                .contains("Watch mode requires an interactive terminal")
+        );
+    }
+}
+
+#[test]
+fn watch_exit_remains_responsive_while_the_account_lock_is_held() {
+    let case = Case::new();
+    case.seed("one@example.com", "user-one", "account-one");
+    let _lock = cxa::fs::ExclusiveLock::acquire(&case.store.join("switch.lock")).unwrap();
+    let mut command = case.command();
+    command.arg("watch");
+    let mut watch = PtyChild::spawn(command);
+
+    watch.wait_for_output(b"\x1b[?25l");
+    watch.send(b"q");
+    watch.wait_success();
+    watch.assert_terminal_restored();
+}
+
+#[test]
+fn unrelated_keys_do_not_consume_the_watch_interval() {
+    let case = Case::new();
+    case.seed("one@example.com", "user-one", "account-one");
+    let mut command = case.command();
+    command.args(["watch", "--interval", "5"]);
+    let mut watch = PtyChild::spawn(command);
+
+    watch.wait_for_output(b"refresh in 5s");
+    for _ in 0..10 {
+        watch.send(b"\x1b[A");
+    }
+    thread::sleep(Duration::from_millis(250));
+    watch.read_available(Duration::from_millis(50));
+    assert!(
+        !watch
+            .output
+            .windows(b"refresh in 4s".len())
+            .any(|window| window == b"refresh in 4s"),
+        "unrelated input advanced the countdown: {}",
+        String::from_utf8_lossy(&watch.output)
+    );
+    watch.send(b"q");
+    watch.wait_success();
+    watch.assert_terminal_restored();
+}
+
+#[test]
+fn watch_cancels_active_quota_workers_before_exiting() {
+    let case = Case::new();
+    case.seed("one@example.com", "user-one", "account-one");
+    let codex = case.home.join("slow-codex");
+    write_executable(
+        &codex,
+        r#"#!/bin/sh
+case "$CODEX_HOME" in
+  "$CXA_ACCOUNT_STORE"/.quota-*)
+    trap 'touch "$CXA_ACCOUNT_STORE/quota.stopped"; exit 0' HUP INT TERM
+    while IFS= read -r line; do
+      case "$line" in
+        *'"id":0'*) printf '%s\n' '{"id":0,"result":{}}' ;;
+        *'"id":1'*) printf '%s\n' '{"id":1,"result":{}}' ;;
+        *'"id":2'*)
+          touch "$CXA_ACCOUNT_STORE/quota.started"
+          while :; do sleep 1; done
+          ;;
+      esac
+    done
+    ;;
+  *)
+    while IFS= read -r line; do
+      case "$line" in
+        *'"id":0'*) printf '%s\n' '{"id":0,"result":{}}' ;;
+        *'"method":"config/read"'*) printf '%s\n' '{"id":1,"result":{"config":{"cli_auth_credentials_store":"file"}}}' ;;
+      esac
+    done
+    ;;
+esac
+"#,
+    );
+    let mut command = case.command();
+    command
+        .env_remove("CXA_SKIP_USAGE_REFRESH")
+        .env("CXA_CODEX_BIN", &codex)
+        .arg("watch");
+    let mut watch = PtyChild::spawn(command);
+
+    watch.wait_for_output(b"loading");
+    let started = case.store.join("quota.started");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !started.is_file() && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(20));
+    }
+    assert!(started.is_file());
+    watch.send(b"q");
+    watch.wait_success();
+    watch.assert_terminal_restored();
+    let reserved = watch
+        .output
+        .windows(b"\x1b[1A\x1b[s".len())
+        .position(|window| window == b"\x1b[1A\x1b[s")
+        .unwrap_or_else(|| panic!("no reserved origin in {:?}", watch.output));
+    let loading = watch
+        .output
+        .windows(b"loading".len())
+        .position(|window| window == b"loading")
+        .unwrap();
+    assert!(reserved < loading);
+    assert!(
+        watch
+            .output
+            .windows(b"\x1b[s".len())
+            .any(|window| window == b"\x1b[s")
+    );
+    assert!(
+        watch
+            .output
+            .windows(b"\x1b[u\x1b[J".len())
+            .any(|window| window == b"\x1b[u\x1b[J")
+    );
+    assert!(case.store.join("quota.stopped").is_file());
+    assert!(fs::read_dir(&case.store).unwrap().all(|entry| {
+        !entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with(".quota-")
+    }));
+}
+
+#[test]
+fn termination_signal_restores_watch_terminal_state() {
+    let case = Case::new();
+    case.seed("one@example.com", "user-one", "account-one");
+    let mut command = case.command();
+    command.arg("watch");
+    let mut watch = PtyChild::spawn(command);
+
+    watch.wait_for_output(b"Watching");
+    watch.signal(libc::SIGTERM);
+    watch.wait_success();
+    watch.assert_terminal_restored();
 }
 
 #[test]
