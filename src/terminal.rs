@@ -251,7 +251,7 @@ impl WatchSignals {
     fn install() -> io::Result<Self> {
         WATCH_EXIT_SIGNAL.store(false, Ordering::Relaxed);
         let mut action = unsafe { std::mem::zeroed::<libc::sigaction>() };
-        action.sa_sigaction = request_watch_exit as usize;
+        action.sa_sigaction = request_watch_exit as *const () as usize;
         if unsafe { libc::sigemptyset(&mut action.sa_mask) } != 0 {
             return Err(io::Error::last_os_error());
         }
