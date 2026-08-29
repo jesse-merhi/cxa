@@ -1,10 +1,11 @@
+use std::fmt::Write as _;
 use std::io::{self, IsTerminal, Write as _};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use anstream::println;
+use anstream::print;
 use anstyle::{AnsiColor, Style};
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 
@@ -18,6 +19,8 @@ pub const EMPHASIS: Style = Style::new().bold();
 pub const MUTED: Style = Style::new().dimmed();
 
 const BAR_WIDTH: usize = 16;
+const WATCH_SIGNALS: [libc::c_int; 3] = [libc::SIGHUP, libc::SIGINT, libc::SIGTERM];
+static WATCH_EXIT_SIGNAL: AtomicBool = AtomicBool::new(false);
 
 pub fn usage_plan(usage: Option<&UsageRecord>) -> Option<String> {
     let usage = usage?;
@@ -50,22 +53,28 @@ pub fn usage_recency(usage: Option<&UsageRecord>, now: i64) -> Option<String> {
 }
 
 pub fn print_usage(usage: Option<&UsageRecord>, now: i64) {
+    print!("{}", render_usage(usage, now));
+}
+
+pub fn render_usage(usage: Option<&UsageRecord>, now: i64) -> String {
+    let mut output = String::new();
     let Some(usage) = usage else {
-        println!("    {WARNING}Usage unknown{WARNING:#}");
-        return;
+        writeln!(output, "    {WARNING}Usage unknown{WARNING:#}").unwrap();
+        return output;
     };
     if let Some(error) = &usage.error {
-        println!("    {WARNING}{error}{WARNING:#}");
-        return;
+        writeln!(output, "    {WARNING}{error}{WARNING:#}").unwrap();
+        return output;
     }
     if usage.buckets.is_empty() {
-        println!("    {WARNING}No quota data{WARNING:#}");
-        return;
+        writeln!(output, "    {WARNING}No quota data{WARNING:#}").unwrap();
+        return output;
     }
 
     for bucket in &usage.buckets {
-        print_bucket(bucket, now);
+        write_bucket(&mut output, bucket, now);
     }
+    output
 }
 
 pub struct FetchSpinner {
@@ -74,7 +83,9 @@ pub struct FetchSpinner {
 }
 
 pub struct LiveRegion {
-    rendered_lines: usize,
+    origin_saved: bool,
+    reserved_rows: usize,
+    full_screen: bool,
     active: bool,
 }
 
@@ -87,7 +98,9 @@ impl Default for LiveRegion {
 impl LiveRegion {
     pub fn new() -> Self {
         Self {
-            rendered_lines: 0,
+            origin_saved: false,
+            reserved_rows: 0,
+            full_screen: false,
             active: io::stdout().is_terminal(),
         }
     }
@@ -96,29 +109,74 @@ impl LiveRegion {
         self.active
     }
 
-    pub fn redraw(&mut self, render: impl FnOnce() -> usize) -> io::Result<()> {
-        if self.rendered_lines > 0 {
-            let mut stdout = io::stdout().lock();
-            write!(stdout, "\x1b[{}A\r\x1b[J", self.rendered_lines)?;
-            stdout.flush()?;
+    pub fn width(&self) -> usize {
+        match crossterm::terminal::size() {
+            Ok((columns, _)) if columns > 0 => usize::from(columns),
+            _ => 80,
         }
-        self.rendered_lines = render();
-        io::stdout().flush()
+    }
+
+    pub fn redraw(&mut self, output: &str) -> io::Result<()> {
+        if !self.active {
+            let mut stdout = anstream::stdout();
+            stdout.write_all(output.as_bytes())?;
+            return stdout.flush();
+        }
+        let width = self.width();
+        let rows = rendered_rows(output, width);
+        let height = match crossterm::terminal::size() {
+            Ok((_, rows)) if rows > 0 => usize::from(rows),
+            _ => 24,
+        };
+        let mut control = io::stdout().lock();
+        if self.full_screen {
+            write!(control, "\x1b[H\x1b[2J")?;
+        } else if rows.saturating_add(1) >= height {
+            if self.origin_saved {
+                write!(control, "\x1b[u\x1b[J")?;
+                self.origin_saved = false;
+            }
+            self.full_screen = true;
+            write!(control, "\x1b[H\x1b[2J")?;
+        } else if !self.origin_saved || rows > self.reserved_rows {
+            if self.origin_saved {
+                write!(control, "\x1b[u\x1b[J")?;
+            }
+            for _ in 0..rows {
+                writeln!(control)?;
+            }
+            write!(control, "\x1b[{rows}A\x1b[s")?;
+            self.origin_saved = true;
+            self.reserved_rows = rows;
+        } else {
+            write!(control, "\x1b[u\x1b[J")?;
+        }
+        control.flush()?;
+        drop(control);
+        let mut stdout = anstream::stdout();
+        stdout.write_all(output.as_bytes())?;
+        stdout.flush()
     }
 
     pub fn write_status(&self, status: &str) -> io::Result<()> {
+        let mut control = io::stdout().lock();
+        write!(control, "\r\x1b[2K")?;
+        control.flush()?;
+        drop(control);
         let mut stdout = anstream::stdout();
-        write!(stdout, "\r\x1b[2K{status}")?;
+        write!(stdout, "{status}")?;
         stdout.flush()
     }
 }
 
 pub struct WatchTerminal {
     active: bool,
+    _signals: WatchSignals,
 }
 
 impl WatchTerminal {
     pub fn enter() -> io::Result<Self> {
+        let signals = WatchSignals::install()?;
         crossterm::terminal::enable_raw_mode()?;
         if let Err(error) = enable_output_processing() {
             let _ = crossterm::terminal::disable_raw_mode();
@@ -129,7 +187,10 @@ impl WatchTerminal {
             let _ = crossterm::terminal::disable_raw_mode();
             return Err(error);
         }
-        Ok(Self { active: true })
+        Ok(Self {
+            active: true,
+            _signals: signals,
+        })
     }
 
     fn restore(&mut self) {
@@ -151,16 +212,76 @@ impl Drop for WatchTerminal {
 }
 
 pub fn watch_exit_requested(timeout: Duration) -> io::Result<bool> {
-    if !event::poll(timeout)? {
-        return Ok(false);
+    let deadline = Instant::now() + timeout;
+    let mut first_poll = true;
+    loop {
+        if WATCH_EXIT_SIGNAL.load(Ordering::Relaxed) {
+            return Ok(true);
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if !first_poll && remaining.is_zero() {
+            return Ok(false);
+        }
+        first_poll = false;
+        match event::poll(remaining) {
+            Ok(false) => return Ok(WATCH_EXIT_SIGNAL.load(Ordering::Relaxed)),
+            Ok(true) => {}
+            Err(_error) if WATCH_EXIT_SIGNAL.load(Ordering::Relaxed) => return Ok(true),
+            Err(error) => return Err(error),
+        }
+        let event = match event::read() {
+            Ok(event) => event,
+            Err(_error) if WATCH_EXIT_SIGNAL.load(Ordering::Relaxed) => return Ok(true),
+            Err(error) => return Err(error),
+        };
+        let Event::Key(key) = event else {
+            continue;
+        };
+        if key.kind != KeyEventKind::Release && watch_exit_key(key.code, key.modifiers) {
+            return Ok(true);
+        }
     }
-    let Event::Key(key) = event::read()? else {
-        return Ok(false);
-    };
-    if key.kind == KeyEventKind::Release {
-        return Ok(false);
+}
+
+struct WatchSignals {
+    previous: Vec<(libc::c_int, libc::sigaction)>,
+}
+
+impl WatchSignals {
+    fn install() -> io::Result<Self> {
+        WATCH_EXIT_SIGNAL.store(false, Ordering::Relaxed);
+        let mut action = unsafe { std::mem::zeroed::<libc::sigaction>() };
+        action.sa_sigaction = request_watch_exit as usize;
+        if unsafe { libc::sigemptyset(&mut action.sa_mask) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let mut installed = Self {
+            previous: Vec::new(),
+        };
+        for signal in WATCH_SIGNALS {
+            let mut previous = unsafe { std::mem::zeroed::<libc::sigaction>() };
+            if unsafe { libc::sigaction(signal, &action, &mut previous) } != 0 {
+                return Err(io::Error::last_os_error());
+            }
+            installed.previous.push((signal, previous));
+        }
+        Ok(installed)
     }
-    Ok(watch_exit_key(key.code, key.modifiers))
+}
+
+impl Drop for WatchSignals {
+    fn drop(&mut self) {
+        for (signal, action) in self.previous.iter().rev() {
+            unsafe {
+                libc::sigaction(*signal, action, std::ptr::null_mut());
+            }
+        }
+        WATCH_EXIT_SIGNAL.store(false, Ordering::Relaxed);
+    }
+}
+
+extern "C" fn request_watch_exit(_signal: libc::c_int) {
+    WATCH_EXIT_SIGNAL.store(true, Ordering::Relaxed);
 }
 
 fn watch_exit_key(code: KeyCode, modifiers: KeyModifiers) -> bool {
@@ -235,19 +356,19 @@ impl Drop for FetchSpinner {
     }
 }
 
-fn print_bucket(bucket: &UsageBucket, now: i64) {
+fn write_bucket(output: &mut String, bucket: &UsageBucket, now: i64) {
     let name = bucket_name(bucket);
     if bucket.exhausted_now(now) {
-        println!("    {ERROR}{name}  EXHAUSTED{ERROR:#}");
+        writeln!(output, "    {ERROR}{name}  EXHAUSTED{ERROR:#}").unwrap();
     } else {
-        println!("    {EMPHASIS}{name}{EMPHASIS:#}");
+        writeln!(output, "    {EMPHASIS}{name}{EMPHASIS:#}").unwrap();
     }
     for (fallback, window) in bucket.windows() {
-        print_window(fallback, window, now);
+        write_window(output, fallback, window, now);
     }
 }
 
-fn print_window(fallback: &str, window: &UsageWindow, now: i64) {
+fn write_window(output: &mut String, fallback: &str, window: &UsageWindow, now: i64) {
     let label = window_label(fallback, window.window_minutes);
     let percent = window.used_percent.map(format_percent);
     let bar = progress_bar(window.used_percent);
@@ -257,9 +378,39 @@ fn print_window(fallback: &str, window: &UsageWindow, now: i64) {
         .resets_at
         .map(|reset| format!("  {}", reset_label(reset, now)))
         .unwrap_or_default();
-    println!(
+    writeln!(
+        output,
         "      {MUTED}{label:<8}{MUTED:#} {style}{bar}{style:#} {style}{percent:>3}% used{style:#}{MUTED}{reset}{MUTED:#}"
-    );
+    )
+    .unwrap();
+}
+
+fn rendered_rows(output: &str, width: usize) -> usize {
+    let width = width.max(1);
+    let mut rows: usize = 0;
+    let mut columns: usize = 0;
+    let mut escape = false;
+    for character in output.chars() {
+        if escape {
+            if character == 'm' {
+                escape = false;
+            }
+            continue;
+        }
+        match character {
+            '\x1b' => escape = true,
+            '\n' => {
+                rows += columns.max(1).div_ceil(width);
+                columns = 0;
+            }
+            '\r' => columns = 0,
+            _ => columns += 1,
+        }
+    }
+    if columns > 0 {
+        rows += columns.div_ceil(width);
+    }
+    rows.max(1)
 }
 
 fn bucket_name(bucket: &UsageBucket) -> String {
@@ -411,5 +562,16 @@ mod tests {
         assert!(watch_exit_key(KeyCode::Char('Q'), KeyModifiers::SHIFT));
         assert!(watch_exit_key(KeyCode::Char('c'), KeyModifiers::CONTROL));
         assert!(!watch_exit_key(KeyCode::Char('c'), KeyModifiers::NONE));
+    }
+
+    #[test]
+    fn rendered_row_count_ignores_styles_and_includes_wrapping() {
+        assert_eq!(rendered_rows("12345\n", 5), 1);
+        assert_eq!(rendered_rows("123456\n", 5), 2);
+        assert_eq!(
+            rendered_rows(&format!("{SUCCESS}123456{SUCCESS:#}\n"), 5),
+            2
+        );
+        assert_eq!(rendered_rows("\n", 5), 1);
     }
 }

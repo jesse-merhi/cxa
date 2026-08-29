@@ -214,6 +214,10 @@ impl Store {
         ExclusiveLock::acquire(&self.config.switch_lock)
     }
 
+    pub fn try_lock(&self) -> Result<Option<ExclusiveLock>> {
+        ExclusiveLock::try_acquire(&self.config.switch_lock)
+    }
+
     pub fn sync_session_profile(&self) -> Result<()> {
         let Ok(session) = AuthDocument::read(&self.config.session_auth) else {
             return Ok(());

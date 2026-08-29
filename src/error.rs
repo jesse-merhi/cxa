@@ -22,6 +22,8 @@ pub enum Error {
     Protocol(String),
     #[error("app-server request timed out")]
     Timeout,
+    #[error("operation cancelled")]
+    Cancelled,
 }
 
 impl Error {
