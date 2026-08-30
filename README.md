@@ -10,6 +10,15 @@ and viewing each account's quota.
 It uses Codex's normal credential file, so you can keep launching Codex exactly
 as you do today.
 
+## Demo
+
+Install `cxa`, import the current Codex login, load every account's quota in
+parallel, and switch accounts:
+
+[![Terminal demo of installing, initializing, listing, and switching accounts with cxa](docs/assets/cxa-demo.gif)](docs/assets/cxa-demo.mp4)
+
+Click the preview to open the full 4K video.
+
 ## Requirements
 
 - The [Codex CLI](https://developers.openai.com/codex/cli) installed and
