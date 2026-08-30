@@ -26,32 +26,54 @@ https://github.com/user-attachments/assets/25842439-7304-480a-a0b0-21b9e4c7d18b
 
 ## Install
 
-### Homebrew
+### Homebrew (recommended)
+
+Homebrew installs the matching prebuilt binary on macOS or Linux. Linux users
+can install Homebrew by following the official
+[Homebrew on Linux guide](https://docs.brew.sh/Homebrew-on-Linux).
 
 ```sh
 brew install jesse-merhi/tap/cxa
+cxa init
 ```
 
-### From source
+### Prebuilt binary
+
+Download the archive for your operating system and CPU from
+[GitHub Releases](https://github.com/jesse-merhi/cxa/releases/latest), extract
+it, then run the included installer:
+
+```sh
+./install.sh
+~/.local/bin/cxa init
+```
+
+The installer copies `cxa` to `~/.local/bin`. Add that directory to `PATH` if
+it is not already available in your shell. Linux binaries require glibc 2.35
+or newer.
+
+### Build from source
 
 Requires Rust 1.85 or newer.
 
 ```sh
 cargo install --locked --git https://github.com/jesse-merhi/cxa --bin cxa
+cxa init
 ```
 
-Prebuilt binaries for Intel and Apple silicon Macs, plus x86-64 and ARM64 Linux,
-are available from
-[GitHub Releases](https://github.com/jesse-merhi/cxa/releases/latest). Linux
-binaries require glibc 2.35 or newer. Windows is not currently supported.
+Windows is not currently supported.
 
 ## Quick start
 
-Import the account already signed in to Codex:
+Make sure Codex is signed in with ChatGPT OAuth, then import that account:
 
 ```sh
 cxa init
 ```
+
+If Codex is not signed in yet, run `codex login` first. Codex uses the file
+credential store by default; the [credential storage](#credential-storage)
+section covers custom configurations.
 
 Add another account. `cxa` will open the normal Codex login flow:
 
