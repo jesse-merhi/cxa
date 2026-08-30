@@ -15,9 +15,7 @@ as you do today.
 Install `cxa`, import the current Codex login, load every account's quota in
 parallel, and switch accounts:
 
-[![Terminal demo of installing, initializing, listing, and switching accounts with cxa](docs/assets/cxa-demo.gif)](docs/assets/cxa-demo.mp4)
-
-Click the preview to open the full 4K video.
+https://github.com/user-attachments/assets/25842439-7304-480a-a0b0-21b9e4c7d18b
 
 ## Requirements
 
