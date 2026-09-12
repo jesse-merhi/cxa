@@ -33,6 +33,11 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum CliCommand {
+    /// Temporarily use Astra Ultra and Fast until a reset or deadline.
+    Boost {
+        #[command(subcommand)]
+        command: crate::boost::BoostCommand,
+    },
     /// Import the current Codex login and select it as the first account.
     Init {
         /// Import without asking for confirmation.
@@ -88,9 +93,16 @@ enum CliCommand {
 }
 
 pub fn run(cli: Cli, config: Config) -> Result<()> {
+    if let Some(CliCommand::Boost { command }) = cli.command {
+        config.require_no_credential_override()?;
+        return crate::boost::run(command, config);
+    }
     require_file_credentials(&config)?;
     let app = App::new(config);
     match (cli.command, cli.account) {
+        (Some(CliCommand::Boost { .. }), _) => {
+            unreachable!("boost is handled before account commands")
+        }
         (Some(CliCommand::Init { yes }), _) => app.init(yes),
         (Some(CliCommand::List { watch, interval }), _) => app.list(watch, interval),
         (Some(CliCommand::Watch { interval }), _) => app.list(true, interval),

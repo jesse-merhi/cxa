@@ -148,8 +148,69 @@ Keep the dashboard open with `cxa watch`. It refreshes every 60 seconds; use
 | `cxa status` | Show the selected account and credential state |
 | `cxa relogin <account>` | Re-authenticate a saved account |
 | `cxa import <auth.json>` | Import an existing Codex credential file |
+| `cxa boost start --until <RFC3339> --socket <PATH>` | Boost tasks on an accessible server until a reset or deadline |
+| `cxa boost status` | Show boost state and pending cleanup |
+| `cxa boost stop` | Stop boosted tasks and apply Astra, Medium, Standard |
 
 Use `cxa --help` or `cxa <command> --help` for the complete CLI reference.
+
+## Temporary boost before a quota reset
+
+`cxa boost` runs a background controller for Codex app servers that expose a
+Unix control socket. It uses **GPT-6 Astra, Ultra effort, and Fast mode** until
+the first observed Codex weekly quota reset on an enrolled account or an
+explicit deadline, whichever comes first.
+
+**Current desktop limitation:** the desktop app's local tasks use a private
+stdio connection. CXA cannot attach to those tasks. This command only covers
+tasks on the sockets it prints; it does not claim to control every desktop or
+CLI process. A server must already expose a socket, for example through
+Codex's shared daemon or `codex app-server --listen unix://`. Starting a new
+server does not move existing desktop tasks into it.
+
+```sh
+# Supply your own deadline, including its timezone.
+cxa boost start --until 2026-09-13T00:00:00+10:00 \
+  --socket /absolute/path/to/app-server-control.sock
+cxa boost status
+cxa boost stop
+```
+
+Omit `--socket` to use
+`$CODEX_HOME/app-server-control/app-server-control.sock`, or repeat it to include
+multiple existing servers. CXA checks the live model catalog for Astra, Ultra,
+Medium, and Fast before enabling the mode. It does not change account logins or
+redeem reset credits.
+
+After preflight and a fresh quota read, the controller interrupts and continues
+active user tasks with the boost settings, updates idle tasks, and picks up
+newly loaded tasks after their first real message. Subagents receive settings
+updates in place so their parents retain control of their
+continuation. Permissions, approval settings, and task instructions are kept.
+Task-specific settings are enforced while the mode is active. Global defaults
+are changed only at cutoff, so starting a task in an unreachable desktop
+server cannot silently inherit boost settings from CXA.
+
+At cutoff, CXA interrupts tracked tasks and subagents, sets them to **Astra,
+Medium, Standard**, and sets the same global defaults, including Plan-mode
+effort. It does this even if a task originally used a different model or
+already used Ultra and Fast. It does not continue tasks after cutoff; you may
+resume them yourself. Scheduled work and manually started tasks can still run
+later. The Fast control remains available for later manual use.
+
+The controller continues after its launching terminal closes. It reads fresh
+quota approximately every 15 seconds; a weekly usage decrease or an observed
+weekly rollover triggers a conservative early stop. Missing or failed quota
+reads stop the boost instead of being treated as a reset. Network latency,
+requests already in flight, and machine sleep mean detection is not instant
+and cannot guarantee zero consumption of newly reset quota. On wake, an
+expired deadline triggers cleanup before any further boost action.
+
+State is stored privately under `$CXA_ACCOUNT_STORE/boost` (normally
+`~/.codex-auth/boost`). If the controller is killed, the machine restarts, or a
+server becomes unreachable, run `cxa boost status`, restore access to the
+server, and run `cxa boost stop`. Cleanup failures remain visible and block a
+new boost; CXA never reports unreachable tasks as successfully stopped.
 
 ## How it works
 
