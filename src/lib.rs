@@ -1,8 +1,11 @@
 pub mod account_store;
 pub mod app_server;
 pub mod auth;
+pub mod boost;
+pub mod boost_policy;
 pub mod cli;
 pub mod config;
+pub mod control;
 pub mod error;
 pub mod fs;
 pub mod terminal;

@@ -16,7 +16,7 @@ use crate::config::Config;
 use crate::fs::{atomic_copy, private_dir};
 use crate::{Error, Result};
 
-const MAX_MESSAGE_SIZE: usize = 4 * 1024 * 1024;
+pub(crate) const MAX_MESSAGE_SIZE: usize = 4 * 1024 * 1024;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
 
 pub fn query_profile(config: &Config, source_auth: &Path) -> (UsageRecord, bool) {
@@ -91,6 +91,81 @@ pub fn require_file_credentials(config: &Config) -> Result<()> {
     stopped
 }
 
+pub fn set_baseline_defaults(config: &Config) -> Result<()> {
+    config.require_no_credential_override()?;
+    let mut client = SpawnedClient::start(
+        config.codex_binary(),
+        &config.codex_home,
+        CredentialStore::Effective,
+        CancellationToken::default(),
+    )?;
+    let updated = set_baseline_defaults_with_client(&mut client);
+    let stopped = client.finish();
+    updated?;
+    stopped
+}
+
+fn set_baseline_defaults_with_client(client: &mut impl RpcClient) -> Result<()> {
+    initialize(client)?;
+    let current = client.request(1, "config/read", Some(json!({"includeLayers": true})))?;
+    let edit = |key_path: &str, value: Value| {
+        json!({
+            "keyPath": key_path,
+            "value": value,
+            "mergeStrategy": "replace"
+        })
+    };
+    let version = user_config_version(&current)
+        .ok_or_else(|| Error::Protocol("config/read returned no user config version".into()))?;
+    let params = json!({
+        "edits": [
+            edit("model", json!("gpt-6-astra")),
+            edit("model_reasoning_effort", json!("medium")),
+            edit("plan_mode_reasoning_effort", json!("medium")),
+            edit("service_tier", json!("default")),
+            edit("features.fast_mode", json!(true))
+        ],
+        "reloadUserConfig": true,
+        "expectedVersion": version
+    });
+    client.request(2, "config/batchWrite", Some(params))?;
+    Ok(())
+}
+
+fn user_config_version(config_read: &Value) -> Option<&str> {
+    let is_base_user = |layer: &&Value| {
+        layer.pointer("/name/type").and_then(Value::as_str) == Some("user")
+            && layer.pointer("/name/profile").is_none_or(Value::is_null)
+    };
+    config_read
+        .get("layers")
+        .and_then(Value::as_array)
+        .and_then(|layers| {
+            layers
+                .iter()
+                .find(is_base_user)
+                .or_else(|| {
+                    layers.iter().find(|layer| {
+                        layer.pointer("/name/type").and_then(Value::as_str) == Some("user")
+                    })
+                })
+                .and_then(|layer| layer.get("version"))
+                .and_then(Value::as_str)
+        })
+        .or_else(|| {
+            config_read
+                .get("origins")
+                .and_then(Value::as_object)
+                .and_then(|origins| {
+                    origins.values().find(|metadata| {
+                        metadata.pointer("/name/type").and_then(Value::as_str) == Some("user")
+                    })
+                })
+                .and_then(|metadata| metadata.get("version"))
+                .and_then(Value::as_str)
+        })
+}
+
 fn query_profile_inner(
     config: &Config,
     source_auth: &Path,
@@ -138,26 +213,48 @@ fn error_kind(error: &Error) -> &'static str {
     }
 }
 
-trait RpcClient {
+pub(crate) trait RpcClient {
     fn send(&mut self, message: Value) -> Result<()>;
     fn receive(&mut self, deadline: Instant) -> Result<Value>;
+
+    fn request_timeout(&self) -> Duration {
+        REQUEST_TIMEOUT
+    }
+
+    fn request_deadline(&self) -> Result<Instant> {
+        Ok(Instant::now() + self.request_timeout())
+    }
+
+    fn handle_foreign_message(&mut self, _message: &Value) -> Result<()> {
+        Ok(())
+    }
 
     fn request(&mut self, id: i64, method: &str, params: Option<Value>) -> Result<Value> {
         let mut message = json!({"id": id, "method": method});
         if let Some(params) = params {
             message["params"] = params;
         }
+        let deadline = self.request_deadline()?;
         self.send(message)?;
-        let deadline = Instant::now() + REQUEST_TIMEOUT;
         loop {
             let response = self.receive(deadline)?;
-            if response.get("id").and_then(Value::as_i64) != Some(id) {
+            if response.get("method").is_some()
+                || response.get("id").and_then(Value::as_i64) != Some(id)
+            {
+                self.handle_foreign_message(&response)?;
                 continue;
             }
-            if response.get("error").is_some_and(|value| !value.is_null()) {
-                return Err(Error::Protocol(format!("{method} failed")));
+            if let Some(error) = response.get("error").filter(|value| !value.is_null()) {
+                let detail = error
+                    .get("message")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown app-server error");
+                return Err(Error::Protocol(format!("{method} failed: {detail}")));
             }
-            return Ok(response.get("result").cloned().unwrap_or_else(|| json!({})));
+            return response
+                .get("result")
+                .cloned()
+                .ok_or_else(|| Error::Protocol(format!("{method} returned a malformed response")));
         }
     }
 }
@@ -193,7 +290,7 @@ fn initialize(client: &mut impl RpcClient) -> Result<()> {
     Ok(())
 }
 
-fn parse_usage(result: &Value) -> Result<UsageRecord> {
+pub(crate) fn parse_usage(result: &Value) -> Result<UsageRecord> {
     let mut buckets = if let Some(limits) = result
         .get("rateLimitsByLimitId")
         .and_then(Value::as_object)
@@ -447,7 +544,82 @@ impl Drop for ChildGuard {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+
     use super::*;
+
+    fn config_fixture() -> (tempfile::TempDir, Config, std::path::PathBuf) {
+        let directory = tempfile::tempdir().unwrap();
+        let binary = directory.path().join("codex");
+        fs::write(
+            &binary,
+            r#"#!/bin/sh
+set -eu
+[ "$1" = "app-server" ]
+record="$CODEX_HOME/requests.jsonl"
+IFS= read -r initialize
+printf '%s\n' "$initialize" >> "$record"
+printf '{"id":0,"result":{}}\n'
+IFS= read -r initialized
+printf '%s\n' "$initialized" >> "$record"
+IFS= read -r config_read
+printf '%s\n' "$config_read" >> "$record"
+printf '{"id":1,"result":{"config":{"unrelated":"preserved"},"origins":{},"layers":[{"name":{"type":"user","file":"/tmp/config.toml"},"version":"sha256:current","config":{"unrelated":"preserved"}}]}}\n'
+IFS= read -r batch_write
+printf '%s\n' "$batch_write" >> "$record"
+printf '{"id":2,"result":{"status":"ok","filePath":"/tmp/config.toml","version":"sha256:next"}}\n'
+"#,
+        )
+        .unwrap();
+        fs::set_permissions(&binary, fs::Permissions::from_mode(0o700)).unwrap();
+        let codex_home = directory.path().join("codex-home");
+        let account_store = directory.path().join("accounts");
+        fs::create_dir_all(&codex_home).unwrap();
+        fs::create_dir_all(&account_store).unwrap();
+        let record = codex_home.join("requests.jsonl");
+        let config = Config {
+            codex_home: codex_home.clone(),
+            codex_binary: Some(binary),
+            account_store: account_store.clone(),
+            switch_lock: account_store.join("switch.lock"),
+            session_auth: codex_home.join("auth.json"),
+            usage_ttl_seconds: 120,
+            skip_usage_refresh: false,
+        };
+        (directory, config, record)
+    }
+
+    fn recorded_batch_write() -> Value {
+        let (_directory, config, record) = config_fixture();
+        set_baseline_defaults(&config).unwrap();
+        let messages: Vec<Value> = fs::read_to_string(record)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(messages[2]["method"], "config/read");
+        assert_eq!(messages[2]["params"]["includeLayers"], true);
+        messages[3].clone()
+    }
+
+    #[test]
+    fn baseline_defaults_use_one_versioned_batch_without_replacing_other_config() {
+        let request = recorded_batch_write();
+        assert_eq!(request["method"], "config/batchWrite");
+        assert_eq!(request["params"]["expectedVersion"], "sha256:current");
+        assert_eq!(request["params"]["reloadUserConfig"], true);
+        assert_eq!(
+            request["params"]["edits"],
+            json!([
+                {"keyPath": "model", "value": "gpt-6-astra", "mergeStrategy": "replace"},
+                {"keyPath": "model_reasoning_effort", "value": "medium", "mergeStrategy": "replace"},
+                {"keyPath": "plan_mode_reasoning_effort", "value": "medium", "mergeStrategy": "replace"},
+                {"keyPath": "service_tier", "value": "default", "mergeStrategy": "replace"},
+                {"keyPath": "features.fast_mode", "value": true, "mergeStrategy": "replace"}
+            ])
+        );
+    }
 
     #[test]
     fn parses_quota_windows() {
