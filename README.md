@@ -184,8 +184,8 @@ redeem reset credits.
 
 After preflight and a fresh quota read, the controller interrupts and continues
 active user tasks with the boost settings, updates idle tasks, and picks up
-newly loaded tasks. Subagents
-receive settings updates in place so their parents retain control of their
+newly loaded tasks after their first real message. Subagents receive settings
+updates in place so their parents retain control of their
 continuation. Permissions, approval settings, and task instructions are kept.
 Task-specific settings are enforced while the mode is active. Global defaults
 are changed only at cutoff, so starting a task in an unreachable desktop

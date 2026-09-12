@@ -387,9 +387,12 @@ fn monitor(config: &Config, deadline: i64, paths: Vec<PathBuf>, run_id: String) 
     }
     STOP_REQUESTED.store(false, Ordering::Relaxed);
     unsafe {
-        libc::signal(libc::SIGINT, handle_stop as libc::sighandler_t);
-        libc::signal(libc::SIGTERM, handle_stop as libc::sighandler_t);
-        libc::signal(libc::SIGHUP, handle_stop as libc::sighandler_t);
+        libc::signal(libc::SIGINT, handle_stop as *const () as libc::sighandler_t);
+        libc::signal(
+            libc::SIGTERM,
+            handle_stop as *const () as libc::sighandler_t,
+        );
+        libc::signal(libc::SIGHUP, handle_stop as *const () as libc::sighandler_t);
     }
     let mut state = State::preparing(run_id, deadline, paths);
     files.save(&state)?;
@@ -478,11 +481,21 @@ fn active_loop(config: &Config, files: &Files, state: &mut State) -> Result<Stri
                 if let Some(reason) = cutoff(files, state.deadline) {
                     return Ok(reason);
                 }
+                let Some(settings) = live_settings(&mut client, &task.thread_id)? else {
+                    continue;
+                };
                 let newly_enrolled = state.tasks.insert(task.clone());
                 if newly_enrolled {
                     files.save(state)?;
                 }
-                boost_task(&mut client, &task, files, state.deadline, newly_enrolled)?;
+                boost_task(
+                    &mut client,
+                    &task,
+                    &settings,
+                    files,
+                    state.deadline,
+                    newly_enrolled,
+                )?;
             }
         }
         for _ in 0..10 {
@@ -522,7 +535,7 @@ fn require_boost_model(client: &mut ControlClient) -> Result<()> {
                 .is_some_and(|values| {
                     values
                         .iter()
-                        .any(|value| value.get("id").and_then(Value::as_str) == Some(FAST_TIER))
+                        .any(|value| is_fast_tier(value.get("id").and_then(Value::as_str)))
                 });
             if effort(BOOST_EFFORT) && effort(BASELINE_EFFORT) && fast {
                 return Ok(());
@@ -590,11 +603,31 @@ fn loaded_tasks(client: &mut ControlClient, socket: &Path) -> Result<Vec<Task>> 
     Ok(tasks)
 }
 
-fn live_settings(client: &mut ControlClient, id: &str) -> Result<Value> {
-    client.request(
+fn live_settings(client: &mut ControlClient, id: &str) -> Result<Option<Value>> {
+    match client.request(
         "thread/resume",
         json!({"threadId": id, "excludeTurns":true}),
-    )
+    ) {
+        Ok(settings) => Ok(Some(settings)),
+        Err(Error::Protocol(message))
+            if message == format!("thread/resume failed: no rollout found for thread id {id}") =>
+        {
+            let metadata =
+                client.request("thread/read", json!({"threadId":id, "includeTurns":false}))?;
+            // A loaded task can exist before its first message saves a rollout.
+            // It cannot be rejoined yet; enroll it after real work starts.
+            if metadata
+                .pointer("/thread/status/type")
+                .and_then(Value::as_str)
+                == Some("idle")
+            {
+                Ok(None)
+            } else {
+                Err(Error::Protocol(message))
+            }
+        }
+        Err(error) => Err(error),
+    }
 }
 
 fn active_turn(client: &mut ControlClient, id: &str) -> Result<Option<String>> {
@@ -628,6 +661,10 @@ fn interrupt(client: &mut ControlClient, id: &str) -> Result<bool> {
     Ok(true)
 }
 
+fn is_fast_tier(tier: Option<&str>) -> bool {
+    matches!(tier, Some("fast" | "priority"))
+}
+
 fn settings_match(settings: &Value, boosted: bool) -> bool {
     settings.get("model").and_then(Value::as_str) == Some(BOOST_MODEL)
         && settings.get("reasoningEffort").and_then(Value::as_str)
@@ -637,7 +674,7 @@ fn settings_match(settings: &Value, boosted: bool) -> bool {
                 BASELINE_EFFORT
             })
         && if boosted {
-            settings.get("serviceTier").and_then(Value::as_str) == Some(FAST_TIER)
+            is_fast_tier(settings.get("serviceTier").and_then(Value::as_str))
         } else {
             settings.get("serviceTier").and_then(Value::as_str) == Some(BASELINE_TIER)
         }
@@ -654,7 +691,7 @@ fn set_task_settings(client: &mut ControlClient, id: &str, boosted: bool) -> Res
     )?;
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
-        if settings_match(&live_settings(client, id)?, boosted) {
+        if live_settings(client, id)?.is_some_and(|settings| settings_match(&settings, boosted)) {
             return Ok(());
         }
         if Instant::now() >= deadline {
@@ -669,13 +706,13 @@ fn set_task_settings(client: &mut ControlClient, id: &str, boosted: bool) -> Res
 fn boost_task(
     client: &mut ControlClient,
     task: &Task,
+    settings: &Value,
     files: &Files,
     deadline: i64,
     newly_enrolled: bool,
 ) -> Result<()> {
     let id = &task.thread_id;
-    let settings = live_settings(client, id)?;
-    if !newly_enrolled && settings_match(&settings, true) {
+    if !newly_enrolled && settings_match(settings, true) {
         return Ok(());
     }
     if cutoff(files, deadline).is_some() {
@@ -725,7 +762,9 @@ fn cleanup(config: &Config, files: &Files, state: &mut State) -> Result<()> {
         let result = (|| {
             let mut client = connect(config, &task.socket)?;
             client.set_timeout(CONTROL_TIMEOUT);
-            live_settings(&mut client, &task.thread_id)?;
+            if live_settings(&mut client, &task.thread_id)?.is_none() {
+                return Ok(());
+            }
             interrupt(&mut client, &task.thread_id)?;
             set_task_settings(&mut client, &task.thread_id, false)
         })();

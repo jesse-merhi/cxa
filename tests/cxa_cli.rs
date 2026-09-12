@@ -433,13 +433,25 @@ impl<'a> BoostFixture<'a> {
         serde_json::from_slice(&output.stdout).unwrap()
     }
 
-    fn add_loaded_root(&self) {
+    fn fixture_action(&self, arguments: &[&str]) {
         let output = Command::new(&self.case.codex)
-            .arg("fixture-add-root")
+            .args(arguments)
             .env("FAKE_BOOST_STATE", &self.state)
             .output()
             .unwrap();
         assert_success(&output);
+    }
+
+    fn add_loaded_root(&self) {
+        self.fixture_action(&["fixture-add-root"]);
+    }
+
+    fn add_loaded_empty(&self, id: &str) {
+        self.fixture_action(&["fixture-add-empty", id]);
+    }
+
+    fn activate_task(&self, id: &str) {
+        self.fixture_action(&["fixture-activate", id]);
     }
 
     fn wait_for_snapshot(
@@ -524,10 +536,48 @@ fn task_state(
         "parentThreadId": parent,
         "canAcceptDirectInput": direct_input,
         "modelProvider": "openai",
+        "status": {"type": "active", "activeFlags": []},
+        "materialized": true,
+        "path": "/tmp/work/thread.jsonl",
         "model": model,
         "reasoningEffort": effort,
         "serviceTier": tier,
+        "permissions": task_permissions(),
         "turn": {"id": format!("turn-{}", parent.unwrap_or("root")), "status": "inProgress"}
+    })
+}
+
+fn empty_task_state() -> Value {
+    json!({
+        "parentThreadId": null,
+        "canAcceptDirectInput": true,
+        "modelProvider": "openai",
+        "status": {"type": "idle"},
+        "materialized": false,
+        "path": "/tmp/work/empty.jsonl",
+        "model": "gpt-5.6-sol",
+        "reasoningEffort": "high",
+        "serviceTier": "default",
+        "permissions": task_permissions(),
+        "turn": null
+    })
+}
+
+fn task_permissions() -> Value {
+    json!({
+        "cwd": "/tmp/work",
+        "approvalPolicy": "on-request",
+        "approvalsReviewer": "user",
+        "sandboxPolicy": {
+            "type": "workspaceWrite",
+            "writableRoots": ["/tmp/work"],
+            "networkAccess": false
+        },
+        "activePermissionProfile": null,
+        "summary": null,
+        "collaborationMode": {"mode": "default"},
+        "multiAgentMode": "explicitRequestOnly",
+        "personality": "pragmatic"
     })
 }
 
@@ -547,8 +597,27 @@ fn fake_boost_state(model_available: bool, endpoint_available: bool, quota: &[f6
         "loaded": ["root-1", "child-1"],
         "tasks": {
             "root-1": task_state(None, true, "gpt-5.6-sol", "high", Value::Null),
-            "child-1": task_state(Some("root-1"), false, "gpt-6-astra", "ultra", json!("fast"))
+            "child-1": task_state(Some("root-1"), false, "gpt-6-astra", "ultra", json!("priority"))
         },
+        "events": []
+    })
+}
+
+fn fake_empty_boost_state() -> Value {
+    json!({
+        "model_available": true,
+        "endpoint_available": true,
+        "quota": [42.0],
+        "quota_index": 0,
+        "defaults": {
+            "model": "gpt-5.6-sol",
+            "reasoningEffort": "high",
+            "planModeReasoningEffort": "medium",
+            "serviceTier": "default",
+            "fastMode": true
+        },
+        "loaded": ["empty-1"],
+        "tasks": {"empty-1": empty_task_state()},
         "events": []
     })
 }
@@ -579,6 +648,11 @@ import threading
 
 state_path = os.environ["FAKE_BOOST_STATE"]
 
+class RpcError(Exception):
+    def __init__(self, code, message):
+        super().__init__(message)
+        self.code = code
+
 def transaction(action):
     lock_path = state_path + ".lock"
     with open(lock_path, "a+") as lock:
@@ -602,17 +676,64 @@ def task_event(state, method, params):
         event["serviceTier"] = params["serviceTier"]
     state["events"].append(event)
 
+def default_permissions():
+    return {
+        "cwd": "/tmp/work",
+        "approvalPolicy": "on-request",
+        "approvalsReviewer": "user",
+        "sandboxPolicy": {
+            "type": "workspaceWrite",
+            "writableRoots": ["/tmp/work"],
+            "networkAccess": False,
+        },
+        "activePermissionProfile": None,
+        "summary": None,
+        "collaborationMode": {"mode": "default"},
+        "multiAgentMode": "explicitRequestOnly",
+        "personality": "pragmatic",
+    }
+
+def empty_task():
+    return {
+        "parentThreadId": None,
+        "canAcceptDirectInput": True,
+        "modelProvider": "openai",
+        "status": {"type": "idle"},
+        "materialized": False,
+        "path": "/tmp/work/empty.jsonl",
+        "model": "gpt-5.6-sol",
+        "reasoningEffort": "high",
+        "serviceTier": "default",
+        "permissions": default_permissions(),
+        "turn": None,
+    }
+
 def add_loaded_root(state):
     state["loaded"].append("root-2")
     state["tasks"]["root-2"] = {
         "parentThreadId": None,
         "canAcceptDirectInput": True,
         "modelProvider": "openai",
+        "status": {"type": "active", "activeFlags": []},
+        "materialized": True,
+        "path": "/tmp/work/thread.jsonl",
         "model": "gpt-5.6-sol",
         "reasoningEffort": "high",
         "serviceTier": None,
+        "permissions": default_permissions(),
         "turn": {"id": "turn-root-2", "status": "inProgress"},
     }
+
+def add_loaded_empty(state, thread_id):
+    state["loaded"].append(thread_id)
+    state["tasks"][thread_id] = empty_task()
+
+def activate_task(state, thread_id):
+    task = state["tasks"][thread_id]
+    task["status"] = {"type": "active", "activeFlags": []}
+    task["materialized"] = True
+    task["turn"] = {"id": "external-" + thread_id, "status": "inProgress"}
+    state["events"].append({"method": "fixture/activate", "threadId": thread_id})
 
 arguments = sys.argv[1:]
 if arguments == ["fixture-snapshot"]:
@@ -620,6 +741,12 @@ if arguments == ["fixture-snapshot"]:
     sys.exit(0)
 if arguments == ["fixture-add-root"]:
     transaction(add_loaded_root)
+    sys.exit(0)
+if len(arguments) == 2 and arguments[0] == "fixture-add-empty":
+    transaction(lambda state: add_loaded_empty(state, arguments[1]))
+    sys.exit(0)
+if len(arguments) == 2 and arguments[0] == "fixture-activate":
+    transaction(lambda state: activate_task(state, arguments[1]))
     sys.exit(0)
 
 def handle(method, params):
@@ -643,16 +770,21 @@ def handle(method, params):
     if method == "thread/read":
         def read_task(state):
             task = state["tasks"][params["threadId"]]
+            task_event(state, method, params)
             return {"thread": {
                 "id": params["threadId"],
                 "parentThreadId": task["parentThreadId"],
                 "canAcceptDirectInput": task["canAcceptDirectInput"],
                 "modelProvider": task["modelProvider"],
+                "status": task["status"],
+                "path": task["path"],
             }}
         return transaction(read_task)
     if method == "thread/resume":
         def resume(state):
             task = state["tasks"][params["threadId"]]
+            if not task["materialized"]:
+                raise RpcError(-32600, "no rollout found for thread id " + params["threadId"])
             return {
                 "model": task["model"],
                 "reasoningEffort": task["reasoningEffort"],
@@ -661,7 +793,14 @@ def handle(method, params):
         return transaction(resume)
     if method == "thread/turns/list":
         def turns(state):
-            turn = state["tasks"][params["threadId"]].get("turn")
+            task = state["tasks"][params["threadId"]]
+            if not task["materialized"]:
+                raise RpcError(
+                    -32600,
+                    "thread " + params["threadId"]
+                    + " is not materialized yet; thread/turns/list is unavailable before first user message",
+                )
+            turn = task.get("turn")
             return {"data": [] if turn is None else [dict(turn)], "nextCursor": None}
         return transaction(turns)
     if method == "turn/interrupt":
@@ -677,7 +816,7 @@ def handle(method, params):
             task = state["tasks"][params["threadId"]]
             task["model"] = params["model"]
             task["reasoningEffort"] = params["effort"]
-            task["serviceTier"] = params["serviceTier"]
+            task["serviceTier"] = "priority" if params["serviceTier"] == "fast" else params["serviceTier"]
             task_event(state, method, params)
             return {}
         return transaction(update)
@@ -686,7 +825,7 @@ def handle(method, params):
             task = state["tasks"][params["threadId"]]
             task["model"] = params["model"]
             task["reasoningEffort"] = params["effort"]
-            task["serviceTier"] = params["serviceTier"]
+            task["serviceTier"] = "priority" if params["serviceTier"] == "fast" else params["serviceTier"]
             task["turn"] = {"id": "continued-" + params["threadId"], "status": "inProgress"}
             task_event(state, method, params)
             return {}
@@ -752,6 +891,24 @@ def handle(method, params):
             return {}
         return transaction(batch_write)
     raise ValueError("unsupported method: " + method)
+
+def settings_updated(thread_id):
+    def notification(state):
+        task = state["tasks"][thread_id]
+        if not task["materialized"]:
+            return None
+        settings = dict(task["permissions"])
+        settings.update({
+            "model": task["model"],
+            "modelProvider": task["modelProvider"],
+            "serviceTier": task["serviceTier"],
+            "effort": task["reasoningEffort"],
+        })
+        return {
+            "method": "thread/settings/updated",
+            "params": {"threadId": thread_id, "threadSettings": settings},
+        }
+    return transaction(notification)
 
 def receive_exact(connection, size):
     chunks = []
@@ -827,7 +984,14 @@ def serve_connection(connection):
                 result = handle(message["method"], message.get("params", {}))
                 response = {"id": message["id"], "result": result}
             except Exception as error:
-                response = {"id": message["id"], "error": {"code": -32603, "message": str(error)}}
+                response = {"id": message["id"], "error": {
+                    "code": getattr(error, "code", -32603),
+                    "message": str(error),
+                }}
+            if message["method"] == "thread/settings/update" and "result" in response:
+                notification = settings_updated(message["params"]["threadId"])
+                if notification is not None:
+                    send_frame(connection, 1, json.dumps(notification, separators=(",", ":")).encode("utf-8"))
             send_frame(connection, 1, json.dumps(response, separators=(",", ":")).encode("utf-8"))
     except (BrokenPipeError, ConnectionResetError, EOFError):
         pass
@@ -857,7 +1021,10 @@ for line in sys.stdin:
         result = handle(message["method"], message.get("params", {}))
         response = {"id": message["id"], "result": result}
     except Exception as error:
-        response = {"id": message["id"], "error": {"code": -32603, "message": str(error)}}
+        response = {"id": message["id"], "error": {
+            "code": getattr(error, "code", -32603),
+            "message": str(error),
+        }}
     print(json.dumps(response, separators=(",", ":")), flush=True)
 "#;
 
@@ -1639,7 +1806,7 @@ fn boost_deadline_updates_active_new_and_child_tasks_then_restores_standard() {
         Duration::from_secs(4),
         |state| {
             state["tasks"]["root-1"]["reasoningEffort"] == "ultra"
-                && state["tasks"]["root-1"]["serviceTier"] == "fast"
+                && state["tasks"]["root-1"]["serviceTier"] == "priority"
                 && state["tasks"]["child-1"]["reasoningEffort"] == "ultra"
                 && event_index(state, "turn/start", "root-1", Some("ultra")).is_some()
                 && event_index(state, "turn/settings/update", "child-1", Some("ultra")).is_some()
@@ -1673,7 +1840,7 @@ fn boost_deadline_updates_active_new_and_child_tasks_then_restores_standard() {
         "newly loaded root to be interrupted and continued",
         Duration::from_secs(3),
         |state| {
-            state["tasks"]["root-2"]["serviceTier"] == "fast"
+            state["tasks"]["root-2"]["serviceTier"] == "priority"
                 && event_index(state, "turn/interrupt", "root-2", None).is_some()
                 && event_index(state, "turn/start", "root-2", Some("ultra")).is_some()
         },
@@ -1698,8 +1865,76 @@ fn boost_deadline_updates_active_new_and_child_tasks_then_restores_standard() {
         assert_eq!(final_state["tasks"][task]["reasoningEffort"], "medium");
         assert_eq!(final_state["tasks"][task]["serviceTier"], "default");
         assert_ne!(final_state["tasks"][task]["turn"]["status"], "inProgress");
+        assert_eq!(
+            final_state["tasks"][task]["permissions"],
+            task_permissions()
+        );
     }
     assert!(event_index(&final_state, "turn/interrupt", "child-1", None).is_some());
+}
+
+#[test]
+fn boost_skips_no_rollout_tasks_until_work_materializes() {
+    let case = Case::new();
+    case.seed("one@example.com", "user-one", "account-one");
+    let mut boost = BoostFixture::new(&case, fake_empty_boost_state());
+
+    let output = boost.start(20);
+    assert_success(&output);
+    let active = boost.wait_for_phase("active", Duration::from_secs(4));
+    assert_eq!(active["tasks"], json!([]));
+    let initial = boost.snapshot();
+    assert_eq!(initial["tasks"]["empty-1"], empty_task_state());
+    assert!(event_index(&initial, "turn/start", "empty-1", None).is_none());
+    assert!(event_index(&initial, "thread/settings/update", "empty-1", None).is_none());
+
+    boost.add_loaded_empty("empty-2");
+    let both_skipped = boost.wait_for_snapshot(
+        "new empty task to be inspected without enrollment",
+        Duration::from_secs(3),
+        |state| event_index(state, "thread/read", "empty-2", None).is_some(),
+    );
+    assert_eq!(boost.boost_state().unwrap()["tasks"], json!([]));
+    assert_eq!(both_skipped["tasks"]["empty-2"], empty_task_state());
+    assert!(event_index(&both_skipped, "turn/start", "empty-2", None).is_none());
+
+    boost.activate_task("empty-1");
+    let enrolled = boost.wait_for_snapshot(
+        "materialized task to be enrolled and continued",
+        Duration::from_secs(3),
+        |state| {
+            state["tasks"]["empty-1"]["serviceTier"] == "priority"
+                && event_index(state, "turn/start", "empty-1", Some("ultra")).is_some()
+        },
+    );
+    let activated = event_index(&enrolled, "fixture/activate", "empty-1", None).unwrap();
+    let interrupted = event_index(&enrolled, "turn/interrupt", "empty-1", None).unwrap();
+    let continued = event_index(&enrolled, "turn/start", "empty-1", Some("ultra")).unwrap();
+    assert!(activated < interrupted && interrupted < continued);
+    assert_eq!(
+        boost.boost_state().unwrap()["tasks"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+
+    let output = boost.run(&["boost", "stop"]);
+    assert_success(&output);
+    let stopped = boost.wait_for_phase("stopped", Duration::from_secs(8));
+    assert_eq!(stopped["reason"], "Stop requested");
+    assert_eq!(stopped["tasks"], json!([]));
+    let final_state = boost.snapshot();
+    assert_eq!(final_state["tasks"]["empty-1"]["model"], "gpt-6-astra");
+    assert_eq!(final_state["tasks"]["empty-1"]["reasoningEffort"], "medium");
+    assert_eq!(final_state["tasks"]["empty-1"]["serviceTier"], "default");
+    assert_eq!(
+        final_state["tasks"]["empty-1"]["turn"]["status"],
+        "interrupted"
+    );
+    assert_eq!(final_state["tasks"]["empty-2"], empty_task_state());
+    assert!(event_index(&final_state, "turn/start", "empty-2", None).is_none());
+    assert!(event_index(&final_state, "thread/settings/update", "empty-2", None).is_none());
 }
 
 #[test]
@@ -1751,6 +1986,7 @@ fn boost_preflight_failure_does_not_mutate_defaults_or_tasks() {
 fn boost_stop_recovers_recorded_pending_cleanup() {
     let case = Case::new();
     let boost = BoostFixture::new(&case, fake_boost_state(true, true, &[50.0]));
+    boost.add_loaded_empty("empty-legacy");
     let state_dir = case.store.join("boost");
     fs::create_dir_all(&state_dir).unwrap();
     fs::write(
@@ -1760,11 +1996,18 @@ fn boost_stop_recovers_recorded_pending_cleanup() {
             "phase": "cleanupRequired",
             "deadline": Utc::now().timestamp() + 300,
             "sockets": [&boost.socket],
-            "tasks": [{
-                "socket": &boost.socket,
-                "thread_id": "root-1",
-                "child": false
-            }],
+            "tasks": [
+                {
+                    "socket": &boost.socket,
+                    "thread_id": "root-1",
+                    "child": false
+                },
+                {
+                    "socket": &boost.socket,
+                    "thread_id": "empty-legacy",
+                    "child": false
+                }
+            ],
             "activated": true,
             "defaults_pending": true,
             "reason": "controller interrupted",
@@ -1787,5 +2030,7 @@ fn boost_stop_recovers_recorded_pending_cleanup() {
         assert_eq!(final_state["tasks"][task]["reasoningEffort"], "medium");
         assert_eq!(final_state["tasks"][task]["serviceTier"], "default");
     }
+    assert_eq!(final_state["tasks"]["empty-legacy"], empty_task_state());
+    assert!(event_index(&final_state, "thread/settings/update", "empty-legacy", None).is_none());
     assert_eq!(final_state["defaults"]["serviceTier"], "default");
 }

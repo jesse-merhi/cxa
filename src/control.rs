@@ -680,6 +680,14 @@ server.listen(1)
 open(ready_path, 'w').close()
 connection, _ = server.accept()
 
+def wait_for_client_close():
+    connection.settimeout(1)
+    try:
+        while connection.recv(1024):
+            pass
+    except (ConnectionResetError, socket.timeout):
+        pass
+
 request = b''
 while not request.endswith(b'\r\n\r\n'):
     request += connection.recv(1)
@@ -704,6 +712,7 @@ upgrade = (
 for byte in upgrade:
     connection.sendall(bytes([byte]))
 if mode == 'bad_accept':
+    wait_for_client_close()
     sys.exit(0)
 
 def exact(length):
@@ -780,6 +789,7 @@ elif mode == 'trickle':
         pass
 elif mode == 'oversized':
     connection.sendall(bytes([0x81, 127]) + struct.pack('!Q', 4 * 1024 * 1024 + 1))
+    wait_for_client_close()
 else:
     send_json({'method': 'account/updated', 'params': {}})
     send_json({'id': 'approval-1', 'method': 'item/commandExecution/requestApproval', 'params': {}})
@@ -899,7 +909,10 @@ with open(record_path, 'w') as output:
         let error = ControlClient::connect(&config(), &server.socket)
             .err()
             .expect("invalid accept should fail");
-        assert!(matches!(error, Error::Protocol(message) if message.contains("upgrade response")));
+        assert!(
+            matches!(&error, Error::Protocol(message) if message.contains("upgrade response")),
+            "unexpected error: {error:?}"
+        );
         server.finish();
     }
 
@@ -908,7 +921,10 @@ with open(record_path, 'w') as output:
         let server = PythonServer::start("oversized");
         let mut client = ControlClient::connect(&config(), &server.socket).unwrap();
         let error = client.request("account/read", json!({})).unwrap_err();
-        assert!(matches!(error, Error::Protocol(message) if message.contains("oversized")));
+        assert!(
+            matches!(&error, Error::Protocol(message) if message.contains("oversized")),
+            "unexpected error: {error:?}"
+        );
         drop(client);
         server.finish();
     }
