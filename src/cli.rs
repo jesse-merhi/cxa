@@ -12,7 +12,10 @@ use clap::{Parser, Subcommand};
 use tempfile::Builder;
 
 use crate::account_store::{Profile, Store, UsageRecord, now_epoch};
-use crate::app_server::{CancellationToken, query_profile_cancellable, require_file_credentials};
+use crate::app_server::{
+    AuthStatus, CancellationToken, check_profile_cancellable, query_profile_cancellable,
+    require_file_credentials, validate_profile,
+};
 use crate::auth::AuthDocument;
 use crate::config::Config;
 use crate::fs::{ExclusiveLock, atomic_copy, private_dir, remove_file_if_exists};
@@ -65,7 +68,7 @@ enum CliCommand {
     },
     /// Show the selected account and credential-file state.
     Status,
-    /// Switch by slot number or a unique part of the account email.
+    /// Verify and switch by slot number or a unique part of the account email.
     Use { account: String },
     /// Enroll a new ChatGPT OAuth account.
     #[command(trailing_var_arg = true)]
@@ -268,25 +271,10 @@ impl App {
             });
         }
         let selected = self.store.selected();
-        let mut states: Vec<ProfileUsage> = profiles
-            .iter()
-            .map(|profile| {
-                if !self.store.config.skip_usage_refresh
-                    && (force_refresh || self.needs_usage_refresh(profile.slot))
-                {
-                    ProfileUsage::Loading
-                } else {
-                    ProfileUsage::Ready(self.store.usage(profile.slot))
-                }
-            })
-            .collect();
-        let refresh_slots: Vec<u32> = profiles
-            .iter()
-            .zip(&states)
-            .filter_map(|(profile, state)| state.is_loading().then_some(profile.slot))
-            .collect();
+        let mut states: Vec<ProfileState> =
+            profiles.iter().map(|_| ProfileState::Loading).collect();
         let mut frame = 0;
-        if region.is_active() && !refresh_slots.is_empty() {
+        if region.is_active() {
             let output = profile_list(&profiles, selected, &states, now_epoch(), frame);
             region
                 .redraw(&output)
@@ -296,12 +284,13 @@ impl App {
         let cancellation = CancellationToken::default();
         let (sender, receiver) = mpsc::channel();
         let mut workers = UsageWorkers::new(cancellation.clone());
-        for slot in refresh_slots {
+        for profile in &profiles {
+            let slot = profile.slot;
             let sender = sender.clone();
             let config = self.store.config.clone();
             let cancellation = cancellation.clone();
             workers.push(thread::spawn(move || {
-                let result = refresh_usage_for_config(&config, slot, force_refresh, cancellation);
+                let result = check_profile_for_list(&config, slot, force_refresh, cancellation);
                 let _ = sender.send((slot, result));
             }));
         }
@@ -324,17 +313,24 @@ impl App {
             };
             if let Some((slot, result)) = received {
                 completed += 1;
-                match result {
-                    Ok(changed) => session_changed |= changed,
-                    Err(error) if first_error.is_none() => first_error = Some(error),
-                    Err(_) => {}
-                }
+                let auth = match result {
+                    Ok((auth, changed)) => {
+                        session_changed |= changed;
+                        auth
+                    }
+                    Err(error) => {
+                        if first_error.is_none() {
+                            first_error = Some(error);
+                        }
+                        AuthStatus::Unavailable
+                    }
+                };
                 if let Some((index, _)) = profiles
                     .iter()
                     .enumerate()
                     .find(|(_, profile)| profile.slot == slot)
                 {
-                    states[index] = ProfileUsage::Ready(self.store.usage(slot));
+                    states[index] = ProfileState::Ready(self.store.usage(slot), auth);
                 }
             }
             if region.is_active() {
@@ -354,7 +350,7 @@ impl App {
             }
         }
         if workers.join_panicked() && first_error.is_none() {
-            first_error = Some(Error::Message("usage refresh worker failed".into()));
+            first_error = Some(Error::Message("account check worker failed".into()));
         }
         if exit_requested {
             return Ok(ListRefresh::ExitRequested);
@@ -439,6 +435,11 @@ impl App {
     fn switch(&self, selector: &str) -> Result<()> {
         let _lock = self.locked()?;
         let target = self.store.resolve(selector)?;
+        validate_profile(
+            &self.store.config,
+            &self.store.config.profile_auth(target.slot),
+            target.slot,
+        )?;
         if self
             .store
             .usage(target.slot)
@@ -526,9 +527,9 @@ enum ListRefresh {
     ExitRequested,
 }
 
-enum ProfileUsage {
+enum ProfileState {
     Loading,
-    Ready(Option<UsageRecord>),
+    Ready(Option<UsageRecord>, AuthStatus),
 }
 
 struct UsageWorkers {
@@ -572,12 +573,6 @@ impl Drop for UsageWorkers {
     }
 }
 
-impl ProfileUsage {
-    fn is_loading(&self) -> bool {
-        matches!(self, Self::Loading)
-    }
-}
-
 const LOADING_FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
 fn watch_status(remaining: u64, restart_required: bool, width: usize) -> String {
@@ -617,7 +612,7 @@ fn interval_label(seconds: u64) -> String {
 fn profile_list(
     profiles: &[Profile],
     selected: Option<u32>,
-    states: &[ProfileUsage],
+    states: &[ProfileState],
     now: i64,
     frame: usize,
 ) -> String {
@@ -627,16 +622,36 @@ fn profile_list(
             writeln!(output).unwrap();
         }
         match state {
-            ProfileUsage::Loading => {
+            ProfileState::Loading => {
                 write_loading_profile(&mut output, profile, selected == Some(profile.slot), frame);
             }
-            ProfileUsage::Ready(usage) => {
+            ProfileState::Ready(usage, auth) => {
                 output.push_str(&profile_output(
                     profile,
                     selected == Some(profile.slot),
                     usage.as_ref(),
                     now,
                 ));
+                match auth {
+                    AuthStatus::Verified => {
+                        writeln!(output, "    {SUCCESS}Auth accepted{SUCCESS:#}").unwrap();
+                    }
+                    AuthStatus::Rejected => {
+                        writeln!(
+                            output,
+                            "    {WARNING}Auth rejected · cxa relogin {}{WARNING:#}",
+                            profile.slot
+                        )
+                        .unwrap();
+                    }
+                    AuthStatus::Unavailable => {
+                        writeln!(
+                            output,
+                            "    {WARNING}Auth check unavailable · retry{WARNING:#}"
+                        )
+                        .unwrap();
+                    }
+                }
             }
         }
     }
@@ -653,6 +668,22 @@ fn write_loading_profile(output: &mut String, profile: &Profile, selected: bool,
         profile.auth.identity.label()
     )
     .unwrap();
+}
+
+fn check_profile_for_list(
+    config: &Config,
+    slot: u32,
+    force_refresh: bool,
+    cancellation: CancellationToken,
+) -> Result<(AuthStatus, bool)> {
+    let store = Store::new(config.clone());
+    let refresh_quota = !config.skip_usage_refresh && (force_refresh || !store.usage_fresh(slot));
+    let check = check_profile_cancellable(config, &config.profile_auth(slot), cancellation)?;
+    if refresh_quota {
+        let previous = store.usage(slot);
+        write_usage_result(previous.as_ref(), &check.usage, &config.profile_usage(slot))?;
+    }
+    Ok((check.auth, check.session_changed))
 }
 
 fn refresh_usage_for_config(

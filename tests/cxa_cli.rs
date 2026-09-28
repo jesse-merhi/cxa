@@ -204,6 +204,31 @@ case "$*" in
       *'"method":"config/read"'*)
         printf '{"id":1,"result":{"config":{"cli_auth_credentials_store":"%s"}}}\n' "$mode"
         ;;
+      *'"method":"account/read"'*)
+        if [ "$FAKE_ACCOUNT_MISSING" = 1 ]; then
+          printf '%s\n' '{"id":1,"result":{"account":null,"requiresOpenaiAuth":true}}'
+        else
+          printf '%s\n' '{"id":1,"result":{"account":{"type":"chatgpt","email":null,"planType":"pro"},"requiresOpenaiAuth":true}}'
+        fi
+        ;;
+      *'"method":"account/rateLimits/read"'*)
+        if [ -n "$FAKE_RATE_LIMITS_LOG" ]; then printf '%s\n' "$CODEX_HOME" >> "$FAKE_RATE_LIMITS_LOG"; fi
+        if [ -n "$FAKE_REFRESHED" ]; then cp "$FAKE_REFRESHED" "$CODEX_HOME/auth.json"; fi
+        rate_limits_error=$FAKE_RATE_LIMITS_ERROR
+        if [ -n "$FAKE_REJECT_ACCESS_TOKEN" ] && grep -q "$FAKE_REJECT_ACCESS_TOKEN" "$CODEX_HOME/auth.json"; then
+          rate_limits_error=auth
+        fi
+        if [ -n "$FAKE_OFFLINE_ACCESS_TOKEN" ] && grep -q "$FAKE_OFFLINE_ACCESS_TOKEN" "$CODEX_HOME/auth.json"; then
+          rate_limits_error=offline
+        fi
+        if [ "$rate_limits_error" = auth ]; then
+          printf '%s\n' '{"id":2,"error":{"code":-32603,"message":"failed to fetch codex rate limits: 401 Unauthorized; secret-token-value"}}'
+        elif [ "$rate_limits_error" = offline ]; then
+          printf '%s\n' '{"id":2,"error":{"code":-32603,"message":"failed to fetch codex rate limits: connection refused; secret-token-value"}}'
+        else
+          printf '%s\n' '{"id":2,"result":{"rateLimits":{"planType":"pro","primary":{"usedPercent":25}}}}'
+        fi
+        ;;
     esac
   done
   exit 0
@@ -414,6 +439,225 @@ fn switch_works_while_codex_is_running_and_prints_restart_guidance() {
     assert!(String::from_utf8_lossy(&output.stdout).contains(
         "Restart Codex or ChatGPT before expecting an existing session to use this account."
     ));
+}
+
+#[test]
+fn rejected_account_is_not_selected_even_when_usage_refresh_is_skipped() {
+    let case = Case::new();
+    case.seed("one@example.com", "user-one", "account-one");
+    let imported = case.home.join("two.json");
+    write_auth(
+        &imported,
+        "two@example.com",
+        "user-two",
+        "account-two",
+        "token-two",
+    );
+    assert_success(&case.run(&["import", imported.to_str().unwrap()]));
+    let active_before = fs::read(case.codex_home.join("auth.json")).unwrap();
+    let target_before = fs::read(case.store.join("profile-2/auth.json")).unwrap();
+
+    let output = case
+        .command()
+        .env("FAKE_RATE_LIMITS_ERROR", "auth")
+        .arg("2")
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("cxa relogin 2"));
+    assert!(!stderr.contains("secret-token-value"));
+    assert!(!String::from_utf8_lossy(&output.stdout).contains("now selected"));
+    assert_eq!(
+        fs::read(case.codex_home.join("auth.json")).unwrap(),
+        active_before
+    );
+    assert_eq!(
+        fs::read(case.store.join("profile-2/auth.json")).unwrap(),
+        target_before
+    );
+
+    let current_output = case
+        .command()
+        .env("FAKE_RATE_LIMITS_ERROR", "auth")
+        .arg("1")
+        .output()
+        .unwrap();
+    assert!(!current_output.status.success());
+    assert_eq!(
+        fs::read(case.codex_home.join("auth.json")).unwrap(),
+        active_before
+    );
+}
+
+#[test]
+fn unavailable_validation_keeps_the_active_account() {
+    let case = Case::new();
+    case.seed("one@example.com", "user-one", "account-one");
+    let active_before = fs::read(case.codex_home.join("auth.json")).unwrap();
+
+    let output = case
+        .command()
+        .env("FAKE_RATE_LIMITS_ERROR", "offline")
+        .arg("1")
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("Check your connection and try again"));
+    assert!(!stderr.contains("cxa relogin"));
+    assert!(!stderr.contains("secret-token-value"));
+    assert_eq!(
+        fs::read(case.codex_home.join("auth.json")).unwrap(),
+        active_before
+    );
+}
+
+#[test]
+fn failed_validation_keeps_a_rotated_current_account_usable() {
+    let case = Case::new();
+    case.seed("one@example.com", "user-one", "account-one");
+    let refreshed = case.home.join("refreshed.json");
+    write_auth(
+        &refreshed,
+        "one@example.com",
+        "user-one",
+        "account-one",
+        "refreshed-one",
+    );
+
+    let failed = case
+        .command()
+        .env("FAKE_REFRESHED", &refreshed)
+        .env("FAKE_RATE_LIMITS_ERROR", "offline")
+        .arg("1")
+        .output()
+        .unwrap();
+
+    assert!(!failed.status.success());
+    assert_eq!(
+        access_token(&case.codex_home.join("auth.json")),
+        "refreshed-one"
+    );
+    assert_success(&case.run(&["1"]));
+    assert_eq!(
+        access_token(&case.store.join("profile-1/auth.json")),
+        "refreshed-one"
+    );
+    assert_eq!(
+        access_token(&case.codex_home.join("auth.json")),
+        "refreshed-one"
+    );
+}
+
+#[test]
+fn failed_validation_saves_a_rotated_other_profile_without_switching() {
+    let case = Case::new();
+    case.seed("one@example.com", "user-one", "account-one");
+    let imported = case.home.join("two.json");
+    write_auth(
+        &imported,
+        "two@example.com",
+        "user-two",
+        "account-two",
+        "token-two",
+    );
+    assert_success(&case.run(&["import", imported.to_str().unwrap()]));
+    let refreshed = case.home.join("refreshed.json");
+    write_auth(
+        &refreshed,
+        "two@example.com",
+        "user-two",
+        "account-two",
+        "refreshed-two",
+    );
+    let active_before = fs::read(case.codex_home.join("auth.json")).unwrap();
+
+    let failed = case
+        .command()
+        .env("FAKE_REFRESHED", &refreshed)
+        .env("FAKE_RATE_LIMITS_ERROR", "offline")
+        .arg("2")
+        .output()
+        .unwrap();
+
+    assert!(!failed.status.success());
+    assert_eq!(
+        fs::read(case.codex_home.join("auth.json")).unwrap(),
+        active_before
+    );
+    assert_eq!(
+        access_token(&case.store.join("profile-2/auth.json")),
+        "refreshed-two"
+    );
+    assert_success(&case.run(&["2"]));
+    assert_eq!(
+        access_token(&case.codex_home.join("auth.json")),
+        "refreshed-two"
+    );
+}
+
+#[test]
+fn signed_out_account_requires_relogin_before_switching() {
+    let case = Case::new();
+    case.seed("one@example.com", "user-one", "account-one");
+    let active_before = fs::read(case.codex_home.join("auth.json")).unwrap();
+
+    let output = case
+        .command()
+        .env("FAKE_ACCOUNT_MISSING", "1")
+        .arg("1")
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("cxa relogin 1"));
+    assert_eq!(
+        fs::read(case.codex_home.join("auth.json")).unwrap(),
+        active_before
+    );
+}
+
+#[test]
+fn successful_validation_saves_refreshed_target_before_selection() {
+    let case = Case::new();
+    case.seed("one@example.com", "user-one", "account-one");
+    let imported = case.home.join("two.json");
+    write_auth(
+        &imported,
+        "two@example.com",
+        "user-two",
+        "account-two",
+        "token-two",
+    );
+    assert_success(&case.run(&["import", imported.to_str().unwrap()]));
+    let refreshed = case.home.join("refreshed.json");
+    write_auth(
+        &refreshed,
+        "two@example.com",
+        "user-two",
+        "account-two",
+        "refreshed-two",
+    );
+
+    let output = case
+        .command()
+        .env("FAKE_REFRESHED", &refreshed)
+        .arg("2")
+        .output()
+        .unwrap();
+
+    assert_success(&output);
+    assert_eq!(
+        access_token(&case.store.join("profile-2/auth.json")),
+        "refreshed-two"
+    );
+    assert_eq!(
+        access_token(&case.codex_home.join("auth.json")),
+        "refreshed-two"
+    );
 }
 
 #[test]
@@ -665,7 +909,7 @@ while IFS= read -r line; do
     *'"id":0'*) printf '%s\n' '{"id":0,"result":{}}' ;;
     *'"id":1'*)
       case "$line" in *'"refreshToken":false'*) ;; *) exit 2 ;; esac
-      printf '%s\n' '{"id":1,"result":{}}'
+      printf '%s\n' '{"id":1,"result":{"account":{"type":"chatgpt","email":null,"planType":"pro"},"requiresOpenaiAuth":true}}'
       ;;
     *'"id":2'*)
       cp "$FAKE_REFRESHED" "$CODEX_HOME/auth.json"
@@ -696,6 +940,74 @@ done
         access_token(&case.codex_home.join("auth.json")),
         "refreshed-one"
     );
+}
+
+#[test]
+fn list_rechecks_each_account_with_cached_quota_and_reports_auth_state() {
+    let case = Case::new();
+    case.seed("one@example.com", "user-one", "account-one");
+    let imported = case.home.join("two.json");
+    write_auth(
+        &imported,
+        "two@example.com",
+        "user-two",
+        "account-two",
+        "token-two",
+    );
+    assert_success(&case.run(&["import", imported.to_str().unwrap()]));
+    let active_before = fs::read(case.codex_home.join("auth.json")).unwrap();
+    let requests = case.home.join("rate-limits-requests.txt");
+
+    let first = case
+        .command()
+        .env_remove("CXA_SKIP_USAGE_REFRESH")
+        .env("FAKE_RATE_LIMITS_LOG", &requests)
+        .arg("list")
+        .output()
+        .unwrap();
+    assert_success(&first);
+    assert_eq!(fs::read_to_string(&requests).unwrap().lines().count(), 2);
+    let cached_usage = fs::read(case.store.join("profile-2/usage.json")).unwrap();
+
+    let rejected = case
+        .command()
+        .env("FAKE_RATE_LIMITS_LOG", &requests)
+        .env("FAKE_REJECT_ACCESS_TOKEN", "token-two")
+        .arg("list")
+        .output()
+        .unwrap();
+    assert_success(&rejected);
+    let output = String::from_utf8_lossy(&rejected.stdout);
+    assert!(output.contains("one@example.com"));
+    let second = output.find("two@example.com").unwrap();
+    assert!(output[..second].contains("Auth accepted"));
+    assert!(output[second..].contains("cxa relogin 2"));
+    assert!(output[second..].contains("25% used"));
+    assert!(!output.contains("secret-token-value"));
+    assert_eq!(fs::read_to_string(&requests).unwrap().lines().count(), 4);
+    assert_eq!(
+        fs::read(case.store.join("profile-2/usage.json")).unwrap(),
+        cached_usage
+    );
+    assert_eq!(
+        fs::read(case.codex_home.join("auth.json")).unwrap(),
+        active_before
+    );
+
+    let unavailable = case
+        .command()
+        .env("FAKE_OFFLINE_ACCESS_TOKEN", "token-two")
+        .arg("list")
+        .output()
+        .unwrap();
+    assert_success(&unavailable);
+    let output = String::from_utf8_lossy(&unavailable.stdout);
+    assert!(output.contains("one@example.com"));
+    let second = output.find("two@example.com").unwrap();
+    assert!(output[..second].contains("Auth accepted"));
+    assert!(output[second..].contains("Auth check unavailable"));
+    assert!(!output.contains("cxa relogin"));
+    assert!(!output.contains("secret-token-value"));
 }
 
 #[test]
@@ -747,7 +1059,7 @@ if [ "$account" = one ]; then sleep 0.2; fi
 while IFS= read -r line; do
   case "$line" in
     *'"id":0'*) printf '%s\n' '{"id":0,"result":{}}' ;;
-    *'"id":1'*) printf '%s\n' '{"id":1,"result":{}}' ;;
+    *'"id":1'*) printf '%s\n' '{"id":1,"result":{"account":{"type":"chatgpt","email":null,"planType":"pro"},"requiresOpenaiAuth":true}}' ;;
     *'"id":2'*)
       printf '{"id":2,"result":{"rateLimitsByLimitId":{"codex":{"limitId":"codex","planType":"pro","primary":{"usedPercent":%s,"windowDurationMins":10080}},"codex_bengalfox":{"limitId":"codex_bengalfox","limitName":"GPT-5.3-Codex-Spark","planType":"pro","primary":{"usedPercent":0,"windowDurationMins":300},"secondary":{"usedPercent":%s,"windowDurationMins":10080}}}}}\n' "$used" "$spark"
       ;;
@@ -871,6 +1183,32 @@ fn watch_exit_remains_responsive_while_the_account_lock_is_held() {
 }
 
 #[test]
+fn watch_rechecks_authentication_with_usage_refresh_skipped() {
+    let case = Case::new();
+    case.seed("one@example.com", "user-one", "account-one");
+    let requests = case.home.join("rate-limits-requests.txt");
+    let mut command = case.command();
+    command
+        .env("FAKE_RATE_LIMITS_LOG", &requests)
+        .args(["watch", "--interval", "5"]);
+    let mut watch = PtyChild::spawn(command);
+
+    watch.wait_for_output(b"refresh in 5s");
+    let deadline = Instant::now() + Duration::from_secs(8);
+    while fs::read_to_string(&requests)
+        .map(|contents| contents.lines().count())
+        .unwrap_or(0)
+        < 2
+        && Instant::now() < deadline
+    {
+        thread::sleep(Duration::from_millis(20));
+    }
+    watch.send(b"q");
+    watch.wait_success();
+    assert!(fs::read_to_string(&requests).unwrap().lines().count() >= 2);
+}
+
+#[test]
 fn unrelated_keys_do_not_consume_the_watch_interval() {
     let case = Case::new();
     case.seed("one@example.com", "user-one", "account-one");
@@ -911,7 +1249,7 @@ case "$CODEX_HOME" in
     while IFS= read -r line; do
       case "$line" in
         *'"id":0'*) printf '%s\n' '{"id":0,"result":{}}' ;;
-        *'"id":1'*) printf '%s\n' '{"id":1,"result":{}}' ;;
+        *'"id":1'*) printf '%s\n' '{"id":1,"result":{"account":{"type":"chatgpt","email":null,"planType":"pro"},"requiresOpenaiAuth":true}}' ;;
         *'"id":2'*)
           touch "$CXA_ACCOUNT_STORE/quota.started"
           while :; do sleep 1; done
