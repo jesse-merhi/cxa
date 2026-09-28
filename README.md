@@ -81,7 +81,7 @@ Add another account. `cxa` will open the normal Codex login flow:
 cxa add
 ```
 
-List your accounts and their latest known quota:
+List your accounts, their current authentication status, and latest known quota:
 
 ```sh
 cxa list
@@ -107,6 +107,7 @@ $ cxa list
     Codex Spark
       5-hour   [███████░░░░░░░░░]  41% used  resets in 4h 12m
       Weekly   [█░░░░░░░░░░░░░░░]   9% used  resets in 6d 23h
+    Auth accepted
 
   2  work@example.com  Pro 20x · updated just now
     Codex
@@ -114,6 +115,7 @@ $ cxa list
     Codex Spark
       5-hour   [░░░░░░░░░░░░░░░░]   0% used  resets in 4h 48m
       Weekly   [██░░░░░░░░░░░░░░]  12% used  resets in 5d 17h
+    Auth accepted
 
 $ cxa 2
 ✓ Account 2 (work@example.com) is now selected.
@@ -122,9 +124,11 @@ $ cxa 2
 
 The `*` marks the account currently selected in Codex.
 
-When quota data is stale, an interactive terminal immediately lists every
-account with an animated loading indicator, fetches them in parallel, and fills
-each account in as it responds. Redirected output skips the live display and
+`cxa list` checks every saved account on each invocation, including when quota
+is cached or quota refresh is disabled. A rejected account shows
+`cxa relogin <account>`; a connection failure shows that the auth check is
+unavailable. An interactive terminal shows loading indicators while the checks
+run in parallel and fills each account in as it responds. Redirected output
 prints the completed list once.
 
 Keep the dashboard open with `cxa watch`. It refreshes every 60 seconds; use
@@ -139,7 +143,7 @@ Keep the dashboard open with `cxa watch`. It refreshes every 60 seconds; use
 | `cxa init` | Import the current Codex login as account 1 |
 | `cxa add` | Sign in and add another account |
 | `cxa add --device-auth` | Add an account with Codex's device-code flow |
-| `cxa list` | List accounts and their latest known quota |
+| `cxa list` | Check each account and list its latest known quota |
 | `cxa watch` | Keep the live quota dashboard open |
 | `cxa watch --interval 30` | Refresh every 30 seconds |
 | `cxa list --watch` | Open watch mode through `list` |
@@ -153,18 +157,21 @@ Use `cxa --help` or `cxa <command> --help` for the complete CLI reference.
 
 ## How it works
 
-Each account is stored as a profile under `~/.codex-auth`. When you switch,
-`cxa` atomically copies that profile to `$CODEX_HOME/auth.json`, which is the
-standard file-backed credential store used by Codex.
+Each account is stored as a profile under `~/.codex-auth`. Before switching,
+`cxa` checks that Codex's server accepts the saved account. If authentication
+fails, it keeps the current account selected and suggests `cxa relogin <account>`.
+If the check cannot reach the server, it keeps the current account selected and
+asks you to retry. On success, it atomically copies the profile to
+`$CODEX_HOME/auth.json`, the standard file-backed credential store used by Codex.
 
 Codex keeps credentials in memory while it is running. Switching is safe, but
 an existing Codex or ChatGPT process will continue using its previous account
 until you restart it.
 
-To read quota, `cxa` runs `codex app-server` with the saved account in an
-isolated temporary home. This does not change the selected account. Codex owns
-OAuth token refresh; if it refreshes a token during a quota read, `cxa` verifies
-the account identity before saving the updated credentials.
+To check authentication and read quota, `cxa` runs `codex app-server` with the
+saved account in an isolated temporary home. This does not change the selected
+account. Codex owns OAuth token refresh; if it refreshes a token during a quota
+read, `cxa` verifies the account identity before saving the updated credentials.
 
 Account identity includes the ChatGPT user ID and, when available, the
 workspace ID. Accounts and workspaces that share an email address remain
@@ -195,7 +202,7 @@ cxa relogin <account>
 | `CXA_ACCOUNT_STORE` | Override the account profile directory |
 | `CXA_CODEX_BIN` | Override the Codex executable used for login and quota reads |
 | `CXA_USAGE_TTL` | Set the quota cache lifetime in seconds (default: `120`) |
-| `CXA_SKIP_USAGE_REFRESH=1` | Show cached quota without refreshing it |
+| `CXA_SKIP_USAGE_REFRESH=1` | Show cached quota without updating it; list and switching still check authentication |
 
 Values supplied to path variables must be absolute.
 

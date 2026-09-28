@@ -8,7 +8,7 @@ use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
-use tempfile::Builder;
+use tempfile::{Builder, TempDir};
 
 use crate::account_store::{UsageBucket, UsageRecord, UsageWindow, now_epoch};
 use crate::auth::AuthDocument;
@@ -20,7 +20,7 @@ const MAX_MESSAGE_SIZE: usize = 4 * 1024 * 1024;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
 
 pub fn query_profile(config: &Config, source_auth: &Path) -> (UsageRecord, bool) {
-    match query_profile_inner(config, source_auth, CancellationToken::default()) {
+    match with_isolated_profile(config, source_auth, CancellationToken::default(), query) {
         Ok((usage, session_changed)) => (usage.unwrap_or_else(unavailable_usage), session_changed),
         Err(error) => (unavailable_usage(error), false),
     }
@@ -44,7 +44,63 @@ pub fn query_profile_cancellable(
     source_auth: &Path,
     cancellation: CancellationToken,
 ) -> Result<(UsageRecord, bool)> {
-    normalize_cancellable_query(query_profile_inner(config, source_auth, cancellation))
+    normalize_cancellable_query(with_isolated_profile(
+        config,
+        source_auth,
+        cancellation,
+        query,
+    ))
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AuthStatus {
+    Verified,
+    Rejected,
+    Unavailable,
+}
+
+pub struct ProfileCheck {
+    pub auth: AuthStatus,
+    pub usage: UsageRecord,
+    pub session_changed: bool,
+}
+
+enum CheckFailure {
+    Rejected,
+    Unavailable(Error),
+}
+
+pub fn check_profile_cancellable(
+    config: &Config,
+    source_auth: &Path,
+    cancellation: CancellationToken,
+) -> Result<ProfileCheck> {
+    let result = with_isolated_profile(config, source_auth, cancellation, checked_query);
+    match result {
+        Ok((Ok(usage), session_changed)) => Ok(ProfileCheck {
+            auth: AuthStatus::Verified,
+            usage,
+            session_changed,
+        }),
+        Ok((Err(CheckFailure::Rejected), session_changed)) => Ok(ProfileCheck {
+            auth: AuthStatus::Rejected,
+            usage: unavailable_usage(Error::Protocol("authentication rejected".into())),
+            session_changed,
+        }),
+        Ok((Err(CheckFailure::Unavailable(Error::Cancelled)), _)) | Err(Error::Cancelled) => {
+            Err(Error::Cancelled)
+        }
+        Ok((Err(CheckFailure::Unavailable(error)), session_changed)) => Ok(ProfileCheck {
+            auth: AuthStatus::Unavailable,
+            usage: unavailable_usage(error),
+            session_changed,
+        }),
+        Err(error) => Ok(ProfileCheck {
+            auth: AuthStatus::Unavailable,
+            usage: unavailable_usage(error),
+            session_changed: false,
+        }),
+    }
 }
 
 fn normalize_cancellable_query(
@@ -91,13 +147,44 @@ pub fn require_file_credentials(config: &Config) -> Result<()> {
     stopped
 }
 
-fn query_profile_inner(
-    config: &Config,
-    source_auth: &Path,
-    cancellation: CancellationToken,
-) -> Result<(Result<UsageRecord>, bool)> {
+pub fn validate_profile(config: &Config, source_auth: &Path, slot: u32) -> Result<()> {
+    let check = check_profile_cancellable(config, source_auth, CancellationToken::default())?;
+    match check.auth {
+        AuthStatus::Verified => Ok(()),
+        AuthStatus::Rejected => Err(Error::Message(format!(
+            "Account {slot} was rejected by Codex. Run `cxa relogin {slot}` and try again."
+        ))),
+        AuthStatus::Unavailable => Err(Error::Message(format!(
+            "Could not verify account {slot} with Codex. Check your connection and try again."
+        ))),
+    }
+}
+
+fn is_auth_rejection(error: &Value) -> bool {
+    if matches!(error.get("code").and_then(Value::as_i64), Some(401 | 403)) {
+        return true;
+    }
+    let message = error
+        .get("message")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    [
+        "401",
+        "403",
+        "unauthorized",
+        "forbidden",
+        "refresh token",
+        "authentication required",
+        "not authenticated",
+        "not logged in",
+    ]
+    .iter()
+    .any(|marker| message.contains(marker))
+}
+
+fn isolated_profile_home(config: &Config, source_auth: &Path) -> Result<TempDir> {
     private_dir(&config.account_store)?;
-    let original_auth = AuthDocument::read(source_auth)?;
     let home = Builder::new()
         .prefix(".quota-")
         .tempdir_in(&config.account_store)
@@ -107,6 +194,17 @@ fn query_profile_inner(
     if source_config.is_file() {
         atomic_copy(&source_config, &home.path().join("config.toml"), 0o600)?;
     }
+    Ok(home)
+}
+
+fn with_isolated_profile<T>(
+    config: &Config,
+    source_auth: &Path,
+    cancellation: CancellationToken,
+    query: impl FnOnce(&mut SpawnedClient) -> T,
+) -> Result<(T, bool)> {
+    let original_auth = AuthDocument::read(source_auth)?;
+    let home = isolated_profile_home(config, source_auth)?;
 
     let mut client = SpawnedClient::start(
         config.codex_binary(),
@@ -114,7 +212,7 @@ fn query_profile_inner(
         CredentialStore::ForceFile,
         cancellation,
     )?;
-    let usage = query(&mut client);
+    let response = query(&mut client);
     client.finish()?;
     let refreshed_auth = AuthDocument::read(home.path().join("auth.json"))?;
     refreshed_auth.copy_to_same_account(source_auth)?;
@@ -126,7 +224,7 @@ fn query_profile_inner(
             session_changed = refreshed_auth.copy_to_same_account(&config.session_auth)?;
         }
     }
-    Ok((usage, session_changed))
+    Ok((response, session_changed))
 }
 
 fn error_kind(error: &Error) -> &'static str {
@@ -138,24 +236,42 @@ fn error_kind(error: &Error) -> &'static str {
     }
 }
 
+enum RpcFailure {
+    Transport(Error),
+    Server(Value),
+}
+
 trait RpcClient {
     fn send(&mut self, message: Value) -> Result<()>;
     fn receive(&mut self, deadline: Instant) -> Result<Value>;
 
     fn request(&mut self, id: i64, method: &str, params: Option<Value>) -> Result<Value> {
+        self.request_raw(id, method, params)
+            .map_err(|error| match error {
+                RpcFailure::Transport(error) => error,
+                RpcFailure::Server(_) => Error::Protocol(format!("{method} failed")),
+            })
+    }
+
+    fn request_raw(
+        &mut self,
+        id: i64,
+        method: &str,
+        params: Option<Value>,
+    ) -> std::result::Result<Value, RpcFailure> {
         let mut message = json!({"id": id, "method": method});
         if let Some(params) = params {
             message["params"] = params;
         }
-        self.send(message)?;
+        self.send(message).map_err(RpcFailure::Transport)?;
         let deadline = Instant::now() + REQUEST_TIMEOUT;
         loop {
-            let response = self.receive(deadline)?;
+            let response = self.receive(deadline).map_err(RpcFailure::Transport)?;
             if response.get("id").and_then(Value::as_i64) != Some(id) {
                 continue;
             }
             if response.get("error").is_some_and(|value| !value.is_null()) {
-                return Err(Error::Protocol(format!("{method} failed")));
+                return Err(RpcFailure::Server(response["error"].clone()));
             }
             return Ok(response.get("result").cloned().unwrap_or_else(|| json!({})));
         }
@@ -167,6 +283,39 @@ fn query(client: &mut impl RpcClient) -> Result<UsageRecord> {
     client.request(1, "account/read", Some(json!({"refreshToken": false})))?;
     let result = client.request(2, "account/rateLimits/read", None)?;
     parse_usage(&result)
+}
+
+fn checked_query(client: &mut impl RpcClient) -> std::result::Result<UsageRecord, CheckFailure> {
+    initialize(client).map_err(CheckFailure::Unavailable)?;
+    let account = client
+        .request_raw(1, "account/read", Some(json!({"refreshToken": false})))
+        .map_err(classify_check_failure)?;
+    match account.get("account") {
+        Some(Value::Null) => return Err(CheckFailure::Rejected),
+        Some(value) if value.get("type").and_then(Value::as_str) == Some("chatgpt") => {}
+        Some(value) if value.get("type").and_then(Value::as_str).is_some() => {
+            return Err(CheckFailure::Rejected);
+        }
+        _ => {
+            return Err(CheckFailure::Unavailable(Error::Protocol(
+                "account/read returned no account type".into(),
+            )));
+        }
+    }
+    let result = client
+        .request_raw(2, "account/rateLimits/read", None)
+        .map_err(classify_check_failure)?;
+    parse_usage(&result).map_err(CheckFailure::Unavailable)
+}
+
+fn classify_check_failure(error: RpcFailure) -> CheckFailure {
+    match error {
+        RpcFailure::Server(response) if is_auth_rejection(&response) => CheckFailure::Rejected,
+        RpcFailure::Server(_) => {
+            CheckFailure::Unavailable(Error::Protocol("account verification failed".into()))
+        }
+        RpcFailure::Transport(error) => CheckFailure::Unavailable(error),
+    }
 }
 
 fn effective_credential_store(client: &mut impl RpcClient) -> Result<String> {
